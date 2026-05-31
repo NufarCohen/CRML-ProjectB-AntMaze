@@ -1,0 +1,204 @@
+## ----- LuoTest -----
+## ben_maze2d_lg_ev_prob_bt2way_nppp3_rprange02:
+ogb_antM_Gi_ev_prob_luotest:
+  ## the env name, use to init ogb env
+  dataset_name: 'antmaze-giant-stitch-v0'
+  # prob_type: bottom_top_2way
+  num_eval_ep: 5 ## ogb uses 50, which is too much, we use 20.
+  env_seed_start: 0
+
+## -------------------
+
+## Dec 28
+ogb_antM_Gi_ev_prob_numEp20_eSdSt0:
+  dataset_name: 'antmaze-giant-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+
+
+ogb_antM_Lg_ev_prob_numEp20_eSdSt0:
+  dataset_name: 'antmaze-large-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+
+
+ogb_antM_Me_ev_prob_numEp20_eSdSt0:
+  dataset_name: 'antmaze-medium-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+
+
+## ------ Explore Data -------
+
+ogb_antM_MeExpl_ev_prob_numEp20_eSdSt0:
+  dataset_name: 'antmaze-medium-explore-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+
+ogb_antM_LgExpl_ev_prob_numEp20_eSdSt0:
+  dataset_name: 'antmaze-large-explore-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+
+
+## Dec 31
+ogb_HumM_Gi_ev_prob_numEp20_eSdSt0:
+  dataset_name: 'humanoidmaze-giant-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+
+ogb_HumM_Lg_ev_prob_numEp20_eSdSt0:
+  dataset_name: 'humanoidmaze-large-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+
+ogb_HumM_Me_ev_prob_numEp20_eSdSt0:
+  dataset_name: 'humanoidmaze-medium-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+
+
+
+## -------------- Jan 5 ----------------
+
+ogb_HumM_full_jnt_luotest:
+  dataset_name: 'humanoidmaze-medium-stitch-v0'
+  num_eval_ep: 2
+  env_seed_start: 0
+  is_save_full_jnt: True
+
+
+ogb_HumM_Gi_ev_prob_numEp20_eSdSt0_full_jnt:
+  dataset_name: 'humanoidmaze-giant-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+  is_save_full_jnt: True
+
+
+
+
+ogb_HumM_Lg_ev_prob_numEp20_eSdSt0_full_jnt_same2_Jan11:
+  dataset_name: 'humanoidmaze-large-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+  is_save_full_jnt: True
+
+
+ogb_HumM_Me_ev_prob_numEp20_eSdSt0_full_jnt:
+  dataset_name: 'humanoidmaze-medium-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+  is_save_full_jnt: True
+
+
+## ----------- Jan 7 -----------
+ogb_antSoc_Ar_ev_prob_numEp20_eSdSt0:
+  dataset_name: 'antsoccer-arena-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+
+
+ogb_antSoc_Me_ev_prob_numEp20_eSdSt0:
+  dataset_name: 'antsoccer-medium-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+
+
+
+## -------- Jan 12 -----------
+ogb_pointM_Gi_ev_prob_numEp20_eSdSt0:
+  dataset_name: 'pointmaze-giant-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+
+
+ogb_pointM_Lg_ev_prob_numEp20_eSdSt0:
+  dataset_name: 'pointmaze-large-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+
+
+ogb_pointM_Me_ev_prob_numEp20_eSdSt0:
+  dataset_name: 'pointmaze-medium-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+
+
+
+## NOTE:
+## PreAct: do some 0 action before we collect the state. 
+## this is because the ant might 'float' in the intial state, 
+## doing some pre action can make the ant land to ground.
+## -------- Feb 2 -----------
+
+ogb_antM_Gi_ev_prob_numEp20_eSdSt0_preAct1:
+  dataset_name: 'antmaze-giant-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+  step_n_acts_after_init: 1
+
+
+ogb_antM_Lg_ev_prob_numEp20_eSdSt0_preAct1:
+  dataset_name: 'antmaze-large-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+  step_n_acts_after_init: 1
+
+
+ogb_antM_Me_ev_prob_numEp20_eSdSt0_preAct1:
+  dataset_name: 'antmaze-medium-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+  step_n_acts_after_init: 1
+
+
+ogb_antM_MeExpl_ev_prob_numEp20_eSdSt0_preAct1:
+  dataset_name: 'antmaze-medium-explore-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+  step_n_acts_after_init: 1
+
+
+ogb_antM_LgExpl_ev_prob_numEp20_eSdSt0_preAct1:
+  dataset_name: 'antmaze-large-explore-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+  step_n_acts_after_init: 1
+
+
+## -------- Feb 11 -----------
+ogb_antSoc_Ar_ev_prob_numEp20_eSdSt0_preAct1:
+  dataset_name: 'antsoccer-arena-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+  step_n_acts_after_init: 1
+
+
+ogb_antSoc_Me_ev_prob_numEp20_eSdSt0_preAct1:
+  dataset_name: 'antsoccer-medium-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+  step_n_acts_after_init: 1
+
+
+ogb_antSoc_Ar_ev_prob_numEp20_eSdSt0_preAct10:
+  dataset_name: 'antsoccer-arena-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+  step_n_acts_after_init: 1
+
+
+ogb_antSoc_Me_ev_prob_numEp20_eSdSt0_preAct10:
+  dataset_name: 'antsoccer-medium-stitch-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+  step_n_acts_after_init: 1
+
+
+
+## ---------- Apr 21 ----------
+ogb_antM_Gi_Navi_ev_prob_numEp20_eSdSt0_preAct5:
+  dataset_name: 'antmaze-giant-navigate-v0'
+  num_eval_ep: 20
+  env_seed_start: 0
+  step_n_acts_after_init: 5

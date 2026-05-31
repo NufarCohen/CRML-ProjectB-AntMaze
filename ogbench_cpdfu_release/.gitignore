@@ -1,0 +1,19 @@
+__pycache__/
+dist/
+*.py[cod]
+*$py.class
+*.egg-info/
+.DS_Store
+.idea/
+.ruff_cache/
+
+## ----- Luo ------
+luotest/*
+
+datasets/*
+.vscode/*
+data_test/*
+data_gen_scripts/gen_probs_luo/cache/*
+cache/*
+trash/*
+## ---------------
