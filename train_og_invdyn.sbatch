@@ -64,7 +64,7 @@ start_time=$(date +%s)
 
 ## ------------ AntSoccer Arena ------------
 # config="config/ogb_invdyn/og_inv_ant_soc/og_antSoc_Ar_o42d_g4d_invdyn_h120_dout02.py"
-# config="config/ogb_invdyn/og_inv_ant_soc/og_antSoc_Ar_o42d_g17d_invdyn_h120_dout02.py"
+config="config/ogb_invdyn/og_inv_ant_soc/og_antSoc_Ar_o42d_g17d_invdyn_h120_dout02.py"
 
 ## ------------ AntSoccer Medium ------------
 # config="config/ogb_invdyn/og_inv_ant_soc/og_antSoc_Me_o42d_g4d_invdyn_h120_dm4_dout02.py"
@@ -94,15 +94,12 @@ start_time=$(date +%s)
 ## ant maze medium stitch
 #config="config/ogb_invdyn/og_inv_ant/og_antM_Me_o29d_g2d_invdyn_h12.py"
 # config="cconfig/ogb_invdyn/og_inv_ant/og_antM_Me_o29d_g15d_invdyn_h12.py"
- config="config/ogb_invdyn/og_inv_ant/og_antM_Me_o29d_g29d_invdyn_h12_dm5.py"
-
-
-
+#config="config/ogb_invdyn/og_inv_ant/og_antM_Me_o29d_g29d_invdyn_h12_dm5.py"
 
 
 PYTHONDONTWRITEBYTECODE=1 \
 CUDA_VISIBLE_DEVICES=${1:-0} \
-python diffuser/ogb_task/og_inv_dyn/train_og_invdyn.py --config $config --val_ratio 0.05  --val_freq 1000
+python diffuser/ogb_task/og_inv_dyn/train_og_invdyn.py --config $config
 
 end_time=$(date +%s)
 echo "Training ended at: $(date)"

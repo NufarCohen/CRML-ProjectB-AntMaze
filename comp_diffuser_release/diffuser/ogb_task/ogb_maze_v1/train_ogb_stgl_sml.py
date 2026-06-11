@@ -3,8 +3,8 @@ if socket.gethostname() == 'bishop':
     os.environ['PYOPENGL_PLATFORM'] = 'egl'
     os.environ['MUJOCO_GL'] = 'egl'
 else:
-    os.environ['PYOPENGL_PLATFORM'] = 'osmesa'
-    os.environ['MUJOCO_GL'] = 'osmesa'
+    os.environ['PYOPENGL_PLATFORM'] = 'egl' ## for headless rendering, need to be set before importing mujoco
+    os.environ['MUJOCO_GL'] = 'egl'
 
 import diffuser.utils as utils
 import torch, wandb, pdb
@@ -256,12 +256,13 @@ all_configs = dict(dataset_config=dataset_config._dict,
 ckp_path = args.savepath
 wandb.init(
     project="comp_diffuser_release",
+    entity="sh-shalev3-technion-israel-institute-of-technology",
     name=args.logger_name,
     id=args.logger_id,
     dir=ckp_path,
     config=all_configs, ## need to be a dict
     # resume="must",
-    mode='online' if dataset_config.dset_h5path is None else 'disabled'
+    mode='online' #if dataset_config.dset_h5path is None else 'disabled'
 )
 # pdb.set_trace()
 

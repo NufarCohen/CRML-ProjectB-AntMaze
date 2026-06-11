@@ -169,7 +169,7 @@ base = {
 
         ## loading
         'diffusion_loadpath': 'f:diffusion/H{horizon}_T{n_diffusion_steps}',
-        'diffusion_epoch': 'latest',
+        'diffusion_epoch': 'latest'
     },
 
 }

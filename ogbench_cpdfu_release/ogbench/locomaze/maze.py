@@ -9,9 +9,10 @@ from ogbench.locomaze.humanoid import HumanoidEnv
 from ogbench.locomaze.point import PointEnv
 from ogbench.luo_utils.d4rl_m2d_const import get_str_maze_spec
 import ogbench.utils as utils ; import mujoco
+from ogbench.locomaze.two_ant_utils import make_two_ant_tree
 
 
-def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
+def make_maze_env(loco_env_type, maze_env_type, num_ants=1, *args, **kwargs):
     """Factory function for creating a maze environment.
 
     Args:
@@ -166,6 +167,11 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
             # Update XML file.
             xml_file = self.xml_file
             tree = ET.parse(xml_file)
+            if num_ants ==2:
+                tree = make_two_ant_tree(tree)
+            elif num_ants != 1:
+                raise NotImplementedError(f"Only num_ants=1 or num_ants=2 are supported for now, got {num_ants}")
+
             self.update_tree(tree)
             _, maze_xml_file = tempfile.mkstemp(text=True, suffix='.xml')
             tree.write(maze_xml_file)
@@ -857,7 +863,45 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
                 self.model.geom('ball_start_marker').pos[:2] = start_xy
                 mujoco.mj_forward(self.model, self.data)
                 
+        def is_two_ant_env(self):
+            return self.model.nu == 16 and self.model.nq == 37 and self.model.nv == 34
 
+        def get_two_ant_ball_xy(self):
+            if not self.is_two_ant_env():
+                raise RuntimeError(
+                    f"get_two_ant_ball_xy called on non-two-ant env: "
+                    f"nq={self.model.nq}, nv={self.model.nv}, nu={self.model.nu}"
+                )
+
+            qpos = self.data.qpos
+
+            ant1_xy = qpos[0:2].copy()
+            ant2_xy = qpos[15:17].copy()
+            ball_xy = qpos[30:32].copy()
+
+            return ant1_xy, ant2_xy, ball_xy
+
+
+        def set_two_ant_ball_xy(self, ant1_xy=None, ant2_xy=None, ball_xy=None):
+            if not self.is_two_ant_env():
+                raise RuntimeError(
+                    f"set_two_ant_ball_xy called on non-two-ant env: "
+                    f"nq={self.model.nq}, nv={self.model.nv}, nu={self.model.nu}"
+                )
+
+            qpos = self.data.qpos.copy()
+            qvel = self.data.qvel.copy()
+
+            if ant1_xy is not None:
+                qpos[0:2] = ant1_xy
+
+            if ant2_xy is not None:
+                qpos[15:17] = ant2_xy
+
+            if ball_xy is not None:
+                qpos[30:32] = ball_xy
+
+            self.set_state(qpos, qvel)
 
 
     if maze_env_type == 'maze':

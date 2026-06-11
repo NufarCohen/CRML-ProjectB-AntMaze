@@ -144,6 +144,19 @@ register(
         maze_type='arena',
     ),
 )
+##support 2ant in one arena for soccer task
+register(
+    id='antsoccer-twoants-arena-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=1000,
+    kwargs=dict(
+        loco_env_type='ant',
+        maze_env_type='ball',
+        maze_type='arena',
+        num_ants=2,
+    ),
+)
+
 register(
     id='antsoccer-medium-v0',
     entry_point='ogbench.locomaze.maze:make_maze_env',

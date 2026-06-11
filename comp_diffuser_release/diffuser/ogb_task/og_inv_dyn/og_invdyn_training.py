@@ -165,8 +165,8 @@ class OgB_InvDyn_Trainer_v1(object):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            if self.step % getattr(self, 'val_freq', 1000) == 0:
-                self.validate()
+            #if self.step % getattr(self, 'val_freq', 1000) == 0:
+            #   self.validate()
 
             if self.step % self.update_ema_every == 0:
                 self.step_ema()

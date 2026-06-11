@@ -4,7 +4,7 @@ import numpy as np
 from gymnasium import utils
 from gymnasium.envs.mujoco import MujocoEnv
 from gymnasium.spaces import Box
-
+import mujoco
 
 class AntEnv(MujocoEnv, utils.EzPickle):
     """Gymnasium Ant environment.
@@ -50,7 +50,9 @@ class AntEnv(MujocoEnv, utils.EzPickle):
 
         self._reset_noise_scale = reset_noise_scale
 
-        observation_space = Box(low=-np.inf, high=np.inf, shape=(29,), dtype=np.float64)
+        tmp_model = mujoco.MjModel.from_xml_path(xml_file)
+        obs_dim = tmp_model.nq + tmp_model.nv
+        observation_space = Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float64)
 
         MujocoEnv.__init__(
             self,

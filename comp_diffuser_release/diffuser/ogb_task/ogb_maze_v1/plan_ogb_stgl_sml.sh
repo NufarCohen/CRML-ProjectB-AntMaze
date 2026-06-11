@@ -50,13 +50,14 @@ source activate compdfu_ogb_release
 
 ## --------- Planning: OGBench PointMaze Stitch 2D Planner ----------
 ## Giant
-config="config/ogb_pnt_maze/og_pntM_Gi_o2d_Cd_Stgl_PadBuf_Ft64_ts512.py"
+#config="config/ogb_pnt_maze/og_pntM_Gi_o2d_Cd_Stgl_PadBuf_Ft64_ts512.py"
 ## Large
 # config="config/ogb_pnt_maze/og_pntM_Lg_o2d_Cd_Stgl_PadBuf_Ft64_ts512.py"
 ## Medium
 # config="config/ogb_pnt_maze/og_pntM_Me_o2d_Cd_Stgl_PadBuf_Ft64_ts512.py"
 
-
+## --------- Planning: OGBench AntSoccer Arena Stitch Planner ----------
+config="config/ogb_ant_soc/og_antSoc_Ar_o17d_DiTd768_PadBuf_Ft64_ts512_fs4_h160_ovlp56MditD384.py"
 
 
 {
@@ -67,8 +68,7 @@ MUJOCO_EGL_DEVICE_ID=${1:-0} \
 python diffuser/ogb_task/ogb_maze_v1/plan_ogb_stgl_sml.py \
     --config $config \
     --plan_n_ep $2 \
-    --pl_seeds ${3:--1} \
-
+    --pl_seeds ${3:--1}
 
 exit 0
 
