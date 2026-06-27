@@ -12,7 +12,7 @@ np.set_printoptions(precision=3, suppress=True)
 from datetime import datetime
 import os.path as osp
 import diffuser.utils as utils
-from diffuser.ogb_task.ogb_maze_v1.ogb_stgl_sml_planner_v1 import OgB_Stgl_Sml_MazeEnvPlanner_V1
+from diffuser.ogb_task.ogb_maze_v1.ogb_stgl_sml_multi_agent_planner_v1 import OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1
 
 
 
@@ -30,8 +30,10 @@ def main(args_train, args):
 
     ld_config = dict()
 
-    ogmz_planner = OgB_Stgl_Sml_MazeEnvPlanner_V1(args_train, args=args)
+    ogmz_planner = OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1(args_train, args=args)
     ogmz_planner.setup_load( ld_config=ld_config )
+    active_agent_id = 1
+    print("[TwoAnt Planner] active_agent_id =", active_agent_id)
 
     #---------------------------- start planning -----------------------------#
 
@@ -62,6 +64,13 @@ if __name__ == '__main__':
     ## training args
     args_train = Parser().parse_args('diffusion')
     args = Parser().parse_args('plan')
+    args.num_agents = getattr(args, "num_agents", 2)
+    args.multi_agent_env_name = getattr(
+        args,
+        "multi_agent_env_name",
+        "antsoccer-twoants-arena-v0",
+    )
+    args.initial_active_agent_id = getattr(args, "initial_active_agent_id", 1)
     ## 1. get epoch to eval on, by default all
     loadpath = args.logbase, args.dataset, args_train.exp_name
 

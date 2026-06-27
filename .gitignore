@@ -1,1 +1,17 @@
+# Environment and dependencies
+miniforge3/
+Miniforge3-Linux-x86_64.sh
+
+# Logs
+slurm_logs/
+*.out
+*.txt
+
+# Data and models
+deep_learning/
 .deep_learning/
+shared_ogbench_data/
+our_code/
+
+# System files
+.DS_Store
