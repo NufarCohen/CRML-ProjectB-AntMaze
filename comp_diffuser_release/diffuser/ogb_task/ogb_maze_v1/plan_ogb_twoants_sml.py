@@ -1,760 +1,237 @@
-import sys, os; sys.path.append('./')
-os.environ['PYOPENGL_PLATFORM'] = 'egl' ## enable GPU rendering in mujoco
+import sys
+import os
+
+sys.path.append('./')
+
+os.environ['PYOPENGL_PLATFORM'] = 'egl'
 os.environ['MUJOCO_GL'] = 'egl'
-import pdb, torch, copy, pdb, json
+
+import copy
+import os.path as osp
+from datetime import datetime
+
+import numpy as np
+import torch
+
+import diffuser.utils as utils
+from diffuser.datasets.d4rl import Is_OgB_Robot_Env
+from diffuser.ogb_task.ogb_maze_v1.ogb_stgl_sml_multi_agent_planner_v1 import (
+    OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1,
+)
+
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.use_deterministic_algorithms(True)
-##
-import numpy as np
-np.set_printoptions(precision=3, suppress=True)
-from datetime import datetime
-import os.path as osp
-import diffuser.utils as utils
-from diffuser.ogb_task.ogb_maze_v1.ogb_stgl_sml_twoants_planner_v1 import OgB_Stgl_Sml_TwoAnts_MazeEnvPlanner_V1
-from diffuser.ogb_task.ogb_maze_v1.two_ant_planner_utils import (
-    two_ant_obs_to_single_ant_obs,
-    single_ant_action_to_two_ant_action,
-    two_ant_xy_from_obs,
-)
 
+np.set_printoptions(precision=3, suppress=True)
 
 
 class Parser(utils.Parser):
     dataset: str = None
     config: str = None
-    ## should not put any existing variable in config file here
-    pl_seeds: str = '-1' # no seed
-    plan_n_ep: int = -100 ## all if -100, auto parse to int
+    pl_seeds: str = '-1'
+    plan_n_ep: int = -100
+
 
 def main(args_train, args):
-    
-    #---------------------------------- setup ----------------------------------#
-
+    """Run the two-ant sequential handoff planner."""
     ld_config = dict()
 
-    ogmz_planner = OgB_Stgl_Sml_TwoAnts_MazeEnvPlanner_V1(args_train, args=args)
-    ogmz_planner.setup_load( ld_config=ld_config )
-    active_agent_id = 1
-    print("[TwoAnt Planner] active_agent_id =", active_agent_id)
+    planner = OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1(args_train, args=args)
+    planner.setup_load(ld_config=ld_config)
 
-    #---------------------------- start planning -----------------------------#
+    print(
+        "[TwoAnt Relay Planner]\n"
+        f"  multi_agent_env_name     = {args.multi_agent_env_name}\n"
+        f"  ma_mode                  = {args.ma_mode}\n"
+        f"  carrier_order            = {args.carrier_order}\n"
+        f"  handoff_xy               = ({args.handoff_x}, {args.handoff_y})\n"
+        f"  ball_handoff_threshold   = {args.ball_handoff_threshold}\n"
+        f"  ball_goal_threshold      = {args.ball_goal_threshold}\n"
+        f"  ep_st_idx                = {args.ep_st_idx}\n"
+        f"  n_act_per_waypnt         = {args.n_act_per_waypnt}\n"
+        f"  is_replan                = {args.is_replan}\n"
+    )
 
     pl_seeds = args.pl_seeds
 
-    from diffuser.datasets.d4rl import Is_OgB_Robot_Env
     if len(pl_seeds) == 1:
-        ## plan_n_ep
         if Is_OgB_Robot_Env:
-            if pl_seeds[0] == -1: ## no seed
-                avg_result_dict = ogmz_planner.ogb_plan_once(pl_seed=None,)
+            if pl_seeds[0] == -1:
+                avg_result_dict = planner.ogb_plan_once(pl_seed=None)
             else:
-                avg_result_dict = ogmz_planner.ogb_plan_once(pl_seed=pl_seeds[0])
-        
+                avg_result_dict = planner.ogb_plan_once(pl_seed=pl_seeds[0])
+        else:
+            utils.print_color(f'{args.pl_seeds=}')
+            raise NotImplementedError
     else:
-        utils.print_color(f'{args.pl_seeds=}')
-        raise NotImplementedError ## can impl plan_multi_run
+        raise NotImplementedError("This launch file currently supports one planning seed only.")
 
-    ## might prevent the final exception before the program finishes
-    ogmz_planner.env.close()
-    del ogmz_planner.env
-    del ogmz_planner.renderer.env
-    
+    try:
+        planner.env.close()
+    except Exception:
+        pass
+
+    try:
+        del planner.env
+    except Exception:
+        pass
+
+    try:
+        del planner.renderer.env
+    except Exception:
+        pass
+
     return avg_result_dict
 
 
-if __name__ == '__main__':
-    ## training args
-    args_train = Parser().parse_args('diffusion')
-    args = Parser().parse_args('plan')
-    args.two_ant_env_name = "antsoccer-twoants-arena"
-    args.two_ant_active_agent_id = 1
-    ## 1. get epoch to eval on, by default all
+def configure_common_eval_args(args, args_train):
+    """Common sampling / saving config used by the original planner."""
     loadpath = args.logbase, args.dataset, args_train.exp_name
+    args.pl_seeds = utils.parse_seeds_str(args.pl_seeds)
 
-    args.pl_seeds = utils.parse_seeds_str(args.pl_seeds) ## a list of int
-    args.n_batch_acc_probs = 4 ##
-    
-    ### --- Hyper-parameters Setup ---
-    from diffuser.datasets.d4rl import Is_OgB_Robot_Env
-    assert Is_OgB_Robot_Env
-    
-    
-
-    ## Default
-    args.is_replan = None ## placeholder, should be replaced in the if code blcok below
+    args.n_batch_acc_probs = 4
+    args.is_replan = None
     args.n_act_per_waypnt = 2
     args.is_save_pkl = False
     args.is_rd_agv = False
 
-    ## the state dimension used in the diffusion models
-    dfu_ndim = len(args_train.dataset_config['obs_select_dim'])
-
-
-    ## ---------------------------------------
-    ## ----------- Ant Maze Stitch -----------
-    if 'antmaze' in args.dataset.lower() and 'stitch' in  args.dataset.lower():
-        if 'giant' in args.dataset:
-
-            ## Ant Maze Giant
-            if dfu_ndim == 2:
-                ## NOTE: Set the eval start idx, by default starts from 0
-                args.ep_st_idx = 0
-                repl_wp_cfg = {}
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1 ## number of actions per waypoint
-                # args.ev_cp_infer_t_type = 'same_t' ## ours, faster
-                # args.ev_cp_infer_t_type = 'gsc' ## baselines
-                
-                args.ev_cp_infer_t_type = 'interleave' ## ours
-                args.rd_resol = 300 ## website default: 1000
-                # args.is_save_pkl = True ## save the plan/rollout trajs to a pkl file
-
-                args.ev_n_comp = 9
-
-                ## high resolution, etc., other eval/render hyperparameters
-                # args.rd_resol = 1600
-                # args.ep_st_idx = 20
-                # args.is_rd_agv = True
-                # args.is_use_subgoal_marker = False
-                # args.vid_fps = 60
-                ## --------------------------------
-
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    # max_n_repl=0, ## 0: no replan
-                    thres=4,
-                    type='m_2',
-                    ada_dist_minus_n_wp=50,
-                    cond_2_extra=150, ##
-                    n_max_steps=2000, ## 
-                )
-                args.inv_epoch = int(8e5)
-            
-            ## Ant Maze Giant Higher Dim
-            elif dfu_ndim == 15:
-                args.ev_n_comp = 9
-                repl_wp_cfg = {}
-
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1
-                args.ev_cp_infer_t_type = 'interleave'
-
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=15,
-                    thres=4,
-                    type='m_2',
-                    ada_dist_minus_n_wp=0,
-                    cond_2_extra=150, ##
-                    n_max_steps=2000, ## 
-                    used_idxs=(0,1),
-                )
-                args.inv_epoch = int(8e5)
-            ## Ant Maze Giant
-            elif dfu_ndim == 29:
-                args.ev_n_comp = 9 # 8
-                repl_wp_cfg = {}
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1 ## important:
-                args.ev_cp_infer_t_type = 'interleave'
-
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=15, ##
-                    thres=4,
-                    type='m_2',
-                    ada_dist_minus_n_wp=0,
-                    cond_2_extra=150, ## 100?
-                    n_max_steps=2000, ## 
-                    used_idxs=(0,1),
-                )
-                args.inv_epoch = int(8e5)
-        
-        ## Ant Maze Large Stitch
-        elif 'large' in args.dataset:
-            if dfu_ndim == 29:
-                
-                args.ev_cp_infer_t_type = 'interleave' ## gsc / same_t (parallel)
-                args.rd_resol = 300 # 1000
-                # args.is_save_pkl = True
-
-
-                repl_wp_cfg = {}
-                args.ev_n_comp = 5 ## 6,7 is also fine
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1
-
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    # max_n_repl=0, ## no replan
-                    thres=4, ## 
-                    type='m_2',
-                    ada_dist_minus_n_wp=50,
-                    cond_2_extra=150, ## 100?
-                    n_max_steps=1000, ## 
-                    used_idxs=(0,1),
-                )
-                args.inv_epoch = int(8e5)
-
-
-            ## Ant Maze Large Stitch
-            elif dfu_ndim == 15:
-                ## ----------------
-                args.ev_cp_infer_t_type = 'interleave'
-
-                repl_wp_cfg = {}
-                args.ev_n_comp = 6
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    thres=4, 
-                    type='m_2',
-                    ada_dist_minus_n_wp=50,
-                    cond_2_extra=150, ## 100?
-                    n_max_steps=1000, ## 
-                    used_idxs=(0,1),
-                )
-                # pdb.set_trace()
-                args.inv_epoch = int(8e5)
-
-            ## Ant Maze Large Stitch
-            elif dfu_ndim == 2:
-                repl_wp_cfg = {}
-                
-                args.ev_n_comp = 6 ##
-                args.ev_cp_infer_t_type = 'interleave'
-
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    # max_n_repl=0, ## no replan
-                    thres=4, 
-                    type='m_2',
-                    ada_dist_minus_n_wp=50,
-                    cond_2_extra=150, ## 
-                    n_max_steps=1000, ## 
-                )
-
-                args.inv_epoch = int(8e5)
-
-
-        ## Ant Maze Medium
-        elif 'medium' in args.dataset:
-            if dfu_ndim == 29:
-
-                ## ---------------------
-                repl_wp_cfg = {}
-                args.ev_n_comp = 3 ##
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1
-                
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    thres=4,
-                    type='m_2',
-                    ada_dist_minus_n_wp=50,
-                    cond_2_extra=150,
-                    n_max_steps=2000,
-                    used_idxs=(0,1),
-                )
-                # pdb.set_trace()
-                args.inv_epoch = int(8e5)
-
-            ## Ant Maze Medium
-            elif dfu_ndim == 15:
-                repl_wp_cfg = {}
-                args.ev_n_comp = 3 ## 4
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1
-
-                ## -- failure analysis vis --
-                args.ev_cp_infer_t_type = 'interleave'
-                # args.rd_resol = 1000
-                # args.is_save_pkl = True
-                # args.is_rd_agv = True
-                args.is_use_subgoal_marker = True
-                args.vid_fps = 60
-                ## --------------------------
-
-
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    # max_n_repl=0,
-                    thres=4,
-                    type='m_2',
-                    ada_dist_minus_n_wp=50,
-                    cond_2_extra=150,
-                    n_max_steps=2000,
-                    used_idxs=(0,1),
-                )
-                args.inv_epoch = int(8e5)
-
-            
-            ## Ant Maze Medium
-            elif dfu_ndim == 2:
-
-                args.ev_n_comp = 3
-
-                args.ev_cp_infer_t_type = 'interleave'
-                # args.rd_resol = 1000
-                # args.is_save_pkl = True
-                # args.is_rd_agv = True
-                # args.is_use_subgoal_marker = True ## False
-                # args.vid_fps = 60
-
-                # args.ep_st_idx = 40
-                repl_wp_cfg = {}
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1
-
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    # max_n_repl=0, ## no replan
-                    thres=4,
-                    type='m_2',
-                    ada_dist_minus_n_wp=50,
-                    cond_2_extra=150,
-                    n_max_steps=1000,
-                )
-                args.inv_epoch = int(8e5)
-
-    
-    ## ----------------------------------------------------------------
-    ## ---------------------- AntMaze Explore -------------------------
-    ## ----------------------------------------------------------------
-    
-    ## Ant Maze Explore
-    elif 'explore' in  args.dataset.lower() and 'antmaze' in args.dataset.lower():
-        ## Explore Large
-        if 'large' in args.dataset:
-            if dfu_ndim in [29, 15]:
-                args.ev_cp_infer_t_type = 'interleave'
-                repl_wp_cfg = {}
-                args.ev_n_comp = 10
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    thres=2,
-                    ada_dist_minus_n_wp=0,
-                    type='m_2',
-                    cond_2_extra=150,
-                    n_max_steps=2000,
-                    used_idxs=(0,1),
-                )
-                args.inv_epoch = int(8e5)
-
-            ## Explore Large
-            elif dfu_ndim == 2:
-                args.ev_cp_infer_t_type = 'interleave' ## or 'gsc', 'same_t_p'
-                # args.rd_resol = 400
-                # args.is_save_pkl = True
-
-                repl_wp_cfg = {}
-                args.ev_n_comp = 6
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    # max_n_repl=0,
-                    thres=2, ##
-                    type='m_2',
-                    ada_dist_minus_n_wp=0,
-                    cond_2_extra=150,
-                    n_max_steps=1000,
-                )
-                args.inv_epoch = int(8e5)
-
-            else:
-                raise NotImplementedError
-        
-        ## Explore Medium
-        elif 'medium' in args.dataset:
-            if dfu_ndim in [29,15]:
-                repl_wp_cfg = {} 
-                args.ev_n_comp = 5 ## 4
-
-                args.ev_cp_infer_t_type = 'interleave'
-                args.rd_resol = 1000
-                args.is_save_pkl = True
-
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1
-
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    # max_n_repl=0, ## no replan
-                    thres=2, ##
-                    type='m_2',
-                    ada_dist_minus_n_wp=0,
-                    cond_2_extra=150,
-                    n_max_steps=1000, ## 2000
-                    used_idxs=(0,1),
-                )
-                args.inv_epoch = int(8e5)
-            
-            ## Explore Medium
-            elif dfu_ndim == 2:
-                repl_wp_cfg = {}
-                args.ev_n_comp = 5 ## Used
-
-                args.ev_cp_infer_t_type = 'interleave' ## or 'gsc', 'same_t_p'
-                args.rd_resol = 1000
-                args.is_save_pkl = True
-
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1
-
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    # max_n_repl=0, ## replan
-                    thres=2,
-                    type='m_2',
-                    ada_dist_minus_n_wp=0,
-                    cond_2_extra=150,
-                    n_max_steps=1000,
-                )
-                args.inv_epoch = int(8e5)
-
-
-    ## ----------------------------------------------------------------
-    ## ---------------------- Humanoid Stitch -------------------------
-    ## ----------------------------------------------------------------
-
-    ## Only Implemented 2D For Now
-    elif 'humanoid' in args.dataset.lower():
-        if 'giant' in args.dataset:
-            args.ev_n_comp = 11
-            args.inv_epoch = int(16e5)
-
-            args.ev_cp_infer_t_type = 'interleave'
-            args.rd_resol = 1000
-            args.is_save_pkl = True
-            args.ep_st_idx = 80
-
-            repl_wp_cfg = {}
-            args.is_replan = 'ada_dist'
-            args.n_act_per_waypnt = 1 ## important:
-            args.repl_ada_dist_cfg = dict(
-                max_n_repl=10,
-                thres=10,
-                type='m_2',
-                ada_dist_minus_n_wp=300,
-                # ada_dist_minus_n_wp=400, ## TODO:
-                cond_2_extra=150, ## 100?
-                n_max_steps=8000, ## NEW Jan 10
-            )
-
-        ## Humanoid
-        elif 'large' in args.dataset:
-            if dfu_ndim == 23:
-                raise NotImplementedError
-            elif dfu_ndim == 2:
-                ## Humanoid Large
-                args.ev_n_comp = 6
-                args.ev_cp_infer_t_type = 'interleave'
-                # args.rd_resol = 400 ## or 1000
-                # args.is_save_pkl = True
-                # args.ep_st_idx = 80
-
-                ## --------------------
-                # args.ev_n_comp = 5 # 5
-                # args.is_rd_agv = True
-                # args.is_use_subgoal_marker = False
-                # args.vid_fps = 120 ## humanoid
-                # args.ep_st_idx = 60
-                ## -------------------
-
-                args.is_replan = 'ada_dist'
-                repl_wp_cfg = {}
-                args.n_act_per_waypnt = 1
-                
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    thres=10,
-                    type='m_2',
-                    ada_dist_minus_n_wp=300,
-                    cond_2_extra=150,
-                    n_max_steps=5000, ## default for eval
-                )
-                args.inv_epoch = int(8e5)
-        
-        ## Humanoid Medium
-        elif 'medium' in args.dataset:
-            if dfu_ndim == 23:
-                raise NotImplementedError
-            elif dfu_ndim == 2:
-                ## Humanoid Medium
-                args.ev_n_comp = 4
-
-                args.ev_cp_infer_t_type = 'interleave' ## or 'gsc'
-                # args.rd_resol = 1000
-                # args.is_save_pkl = True
-                # args.ep_st_idx = 80
-
-                args.is_replan = 'ada_dist'
-                repl_wp_cfg = {}
-                
-                args.n_act_per_waypnt = 1
-                
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    thres=10,
-                    type='m_2',
-                    ada_dist_minus_n_wp=300,
-                    cond_2_extra=150,
-                    n_max_steps=5000,
-                )
-            args.inv_epoch = int(8e5)
-        else:
-            raise NotImplementedError
-
-    elif 'antsoccer' in args.dataset:
-        ## Soccer
-        if 'arena' in args.dataset:
-            ## a 4D diffusion planner: ant x-y, ball x-y 
-            if dfu_ndim == 4:
-                repl_wp_cfg = {}
-                args.ev_n_comp = 5
-
-                args.ev_cp_infer_t_type = 'interleave'
-                args.is_use_subgoal_marker = False
-                args.ep_st_idx = 60
-                ## teaser animation vis
-                # args.rd_resol = 1200
-                # args.is_rd_agv = True ## render agent view video
-                # args.vid_fps = 60
-
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1 ##
-                
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    thres=4,
-                    type='m_2',
-                    ada_dist_minus_n_wp=50,
-                    cond_2_extra=50, ## 
-                    n_max_steps=5000, ##
-                    used_idxs=(0,1),
-                )
-
-                args.inv_epoch = 'latest'
-                args.is_inv_train_mode = True
-
-            elif dfu_ndim == 17:
-                repl_wp_cfg = {}
-                args.ev_n_comp = 5
-
-                args.ev_cp_infer_t_type = 'interleave'
-                # args.is_use_subgoal_marker = False
-                
-                args.ep_st_idx = 10
-                ## teaser animation vis
-                # args.rd_resol = 1200
-                # args.is_rd_agv = True ## render agent view video
-                # args.vid_fps = 60
-
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 1
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    thres=4,
-                    type='m_2',
-                    ada_dist_minus_n_wp=50,
-                    cond_2_extra=50, ## 
-                    n_max_steps=5000, ## ori default
-                    used_idxs=(0,1),
-                )
-
-                args.inv_epoch = 'latest'
-                args.is_inv_train_mode = True
-
-        ## Soccer
-        elif 'medium' in args.dataset:
-            if dfu_ndim == 17:
-                
-                repl_wp_cfg = {}
-                args.ev_n_comp = 6
-                args.ep_st_idx = 0 ## 20
-                args.is_replan = 'ada_dist'
-                args.ev_cp_infer_t_type = 'interleave'
-                args.rd_resol = 600
-                args.is_save_pkl = True
-                args.is_use_subgoal_marker = False
-
-
-                args.n_act_per_waypnt = 2 ## 1 vis
-
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    thres=6,
-                    type='m_2',
-                    ada_dist_minus_n_wp=0,
-                    cond_2_extra=10,
-                    n_max_steps=5000,
-                    used_idxs=(0,1,),
-                )
-
-                args.inv_epoch = 'latest'
-                args.is_inv_train_mode = True
-
-            ## ---------------------------------
-            ## Soccer Medium
-            elif dfu_ndim == 4:
-                
-                args.ev_cp_infer_t_type = 'interleave'
-                args.rd_resol = 1000 # 600 # 1000
-                args.is_save_pkl = True
-                args.is_use_subgoal_marker = False
-                ## for website
-                args.ep_st_idx = 20
-                args.is_rd_agv = True
-
-
-                repl_wp_cfg = {}
-                ## Jan 10 New Replan Method
-                args.ev_n_comp = 8
-                args.ev_n_comp = 5
-                
-                args.ev_n_comp = 6 ## Jan 17
-                args.ev_n_comp = 7
-                args.ev_n_comp = 8
-
-                args.is_replan = 'ada_dist'
-                args.n_act_per_waypnt = 2
-                args.n_act_per_waypnt = 1
-
-                args.repl_ada_dist_cfg = dict(
-                    max_n_repl=10,
-                    thres=4,
-                    type='m_2',
-                    ada_dist_minus_n_wp=50, ## ?
-                    cond_2_extra=50, ## 100?
-                    n_max_steps=5000,
-                    used_idxs=(0,1,),
-                )
-
-                # args.inv_epoch = int(12e5)
-                args.inv_epoch = 'latest'
-                args.is_inv_train_mode = True
-
-    ## OGBench Point Maze Env
-    elif 'pointmaze' in args.dataset.lower():
-        
-        ## Point Maze Giant
-        if 'giant' in args.dataset:
-            # args.ev_n_comp = 9
-            args.ev_n_comp = 8
-            
-            # args.ev_cp_infer_t_type = 'same_t' ## parallel
-            args.ev_cp_infer_t_type = 'interleave' ## default
-            # args.ev_cp_infer_t_type = 'gsc' ## gsc baseline
-            # args.ev_cp_infer_t_type = 'same_t_p'
-            # args.ev_cp_infer_t_type = 'ar_back' ## backward autoregressive
-
-            # args.rd_resol = 1000
-            # args.is_save_pkl = True ## save rollout stats
-            
-            # args.ep_st_idx = 40 ## starting eval problem idx, default is 0
-
-            ## 
-            repl_wp_cfg = {}
-            args.is_replan = 'ada_dist'
-            args.n_act_per_waypnt = 1
-            args.repl_ada_dist_cfg = dict(
-                max_n_repl=10,
-                # max_n_repl=0, ## no repl abl
-                thres=1,
-                type='m_2',
-                ada_dist_minus_n_wp=10,
-                cond_2_extra=150, ##
-                n_max_steps=1000, ## 
-            )
-            args.inv_epoch = int(8e5)
-
-        elif 'large' in args.dataset:
-            args.ev_n_comp = 5 ##
-            args.ev_n_comp = 6 ## either is fine
-
-            args.ev_cp_infer_t_type = 'interleave'
-
-            repl_wp_cfg = {}
-            args.is_replan = 'ada_dist'
-            args.n_act_per_waypnt = 1
-            args.repl_ada_dist_cfg = dict(
-                # max_n_repl=10,
-                max_n_repl=0, ## no replan
-                thres=1,
-                type='m_2',
-                ada_dist_minus_n_wp=0,
-                cond_2_extra=150, ##
-                n_max_steps=1000, ## 
-            )
-            args.inv_epoch = int(8e5)
-            
-
-        elif 'medium' in args.dataset:
-            args.ev_n_comp = 3 ## or 4
-
-            args.ev_cp_infer_t_type = 'interleave' ## or 'same_t_p'
-
-            repl_wp_cfg = {}
-            args.is_replan = 'ada_dist'
-            args.n_act_per_waypnt = 1
-            args.repl_ada_dist_cfg = dict(
-                # max_n_repl=10,
-                max_n_repl=0, ## no replan ablation
-                thres=1, ## 4
-                type='m_2',
-                ada_dist_minus_n_wp=0,
-                cond_2_extra=150,
-                n_max_steps=1000,
-            )
-            args.inv_epoch = int(8e5)
-
-    else: 
-        raise NotImplementedError
-    
-    ## 
     args.b_size_per_prob = 40
     args.ev_top_n = 5
     args.ev_pick_type = 'first'
     args.tjb_blend_type = 'exp'
     args.tjb_exp_beta = 2
 
-
-    ### Diffusion Sampling Hyper-param
-    args.var_temp = 1.0 ## or 0.5
+    args.var_temp = 1.0
     args.cond_w = 2.0
     args.use_ddim = True
     args.ddim_eta = 1.0
     args.ddim_steps = 50
-    
-    args.repl_wp_cfg = repl_wp_cfg
+
+    return loadpath
+
+
+def configure_two_ant_soccer_relay(args, args_train):
+    """
+    Configure Mode B sequential handoff:
+
+        Ant1 carries ball to handoff_xy.
+        Ant2 automatically wakes up when ball is inside ball_handoff_threshold.
+        Ant2 carries ball from handoff_xy to final_goal_xy.
+
+    Important:
+        final_goal_xy is still loaded from the OGBench eval problem gl_pos[15:17].
+        The handoff point is manually defined here by handoff_x/handoff_y.
+    """
+    dfu_ndim = len(args_train.dataset_config['obs_select_dim'])
+
+    if 'antsoccer' not in args.dataset.lower():
+        raise NotImplementedError(
+            "This launch file is intentionally only for AntSoccer two-ant relay. "
+            f"Got dataset={args.dataset}"
+        )
+
+    if 'arena' not in args.dataset.lower():
+        raise NotImplementedError(
+            "This launch file was prepared for antsoccer arena datasets. "
+            f"Got dataset={args.dataset}"
+        )
+
+    if dfu_ndim not in [4, 17]:
+        raise NotImplementedError(
+            f"Expected AntSoccer diffusion dim 4 or 17, got dfu_ndim={dfu_ndim}"
+        )
+
+    # Real rollout env: two ants, one ball.
+    args.num_agents = 2
+    args.multi_agent_env_name = "antsoccer-twoants-arena-v0"
+
+    # Mode B: only one active carrier at a time.
+    # Ant2 wakes up only after the ball reaches the handoff radius.
+    args.ma_mode = "mode_b_sequential_handoff"
+    args.carrier_order = [1, 2]
+    args.initial_active_agent_id = 1
+
+    # Manual middle point for the relay.
+    # Change these two numbers to control where Ant1 should bring the ball.
+    args.handoff_x = 12.0
+    args.handoff_y = 12.0
+
+    # Wake-up radius for Ant2.
+    # If Ant2 never wakes up, increase this to 3.5 or 4.0.
+    # If Ant2 wakes too early, decrease this to 2.0 or 2.5.
+    args.ball_handoff_threshold = 3.0
+
+    # Success radius around final target.
+    args.ball_goal_threshold = 2.0
+
+    # Evaluation problem index.
+    # This picks start_state[i] and final goal_pos[i] from the OGBench HDF5.
+    # It is not itself a coordinate.
+    args.ep_st_idx = 12
+
+    args.ev_n_comp = 5
+    args.ev_cp_infer_t_type = 'interleave'
+    args.is_use_subgoal_marker = False
+
+    args.is_replan = 'ada_dist'
+    args.n_act_per_waypnt = 1
+    args.repl_ada_dist_cfg = dict(
+        max_n_repl=10,
+        thres=4,
+        type='m_2',
+        ada_dist_minus_n_wp=50,
+        cond_2_extra=50,
+        n_max_steps=5000,
+        used_idxs=(0, 1),
+    )
+
+    args.inv_epoch = 'latest'
+    args.is_inv_train_mode = True
+    args.repl_wp_cfg = {}
+
+    print(
+        "[configure_two_ant_soccer_relay]\n"
+        f"  dfu_ndim                = {dfu_ndim}\n"
+        f"  carrier_order          = {args.carrier_order}\n"
+        f"  handoff_xy             = ({args.handoff_x}, {args.handoff_y})\n"
+        f"  handoff_radius         = {args.ball_handoff_threshold}\n"
+        f"  goal_radius            = {args.ball_goal_threshold}\n"
+        f"  ep_st_idx              = {args.ep_st_idx}\n"
+    )
+
+
+if __name__ == '__main__':
+    args_train = Parser().parse_args('diffusion')
+    args = Parser().parse_args('plan')
+
+    assert Is_OgB_Robot_Env
+
+    loadpath = configure_common_eval_args(args, args_train)
+    configure_two_ant_soccer_relay(args, args_train)
 
     latest_e = utils.get_latest_epoch(loadpath)
-    # n_e = round(latest_e // 1e5) + 1 # all
-    # start_e = 5e5; # 2e5 end_e = 
-    # depoch_list = np.arange(start_e, int(n_e * 1e5), int(1e5), dtype=np.int32).tolist()
-    
-    depoch_list = [latest_e,]
-    ## depoch_list = [800000,] # 1M
-    
+    depoch_list = [latest_e]
+
     if args.is_replan == 'ada_dist':
         args.env_n_max_steps = args.repl_ada_dist_cfg['n_max_steps']
     else:
-        args.env_n_max_steps = None ## use ogb default ??
+        args.env_n_max_steps = None
 
+    sub_dir = (
+        f'{datetime.now().strftime("%y%m%d-%H%M%S-%f")[:-3]}'
+        f'-twoantRelay'
+        f'-nm{int(args.plan_n_ep)}'
+        f'-ems{args.env_n_max_steps // 1000}k'
+        f'-ncp{args.ev_n_comp}'
+        f'-{args.ev_cp_infer_t_type}'
+        f'-handoff{args.handoff_x:.1f}_{args.handoff_y:.1f}'
+        f'-rad{args.ball_handoff_threshold:.1f}'
+        f'-evSd{",".join([str(sd) for sd in args.pl_seeds])}'
+    )
 
-    sub_dir = f'{datetime.now().strftime("%y%m%d-%H%M%S-%f")[:-3]}' + \
-                        f"-nm{int(args.plan_n_ep)}-ems{args.env_n_max_steps//1000}k" + \
-                        f"-ncp{args.ev_n_comp}" + f"-{args.ev_cp_infer_t_type}"\
-                        f"-evSd{','.join( [str(sd) for sd in args.pl_seeds] )}"
-    
-    # pdb.set_trace()
-    ## f'-vt{args.var_temp}'
     if args.is_save_pkl:
         sub_dir += '-pkl'
     if hasattr(args, 'ep_st_idx'):
@@ -765,11 +242,8 @@ if __name__ == '__main__':
     args.savepath = osp.join(args.savepath, sub_dir)
 
     result_list = []
-    for i in range(len(depoch_list)):
-        args_train.diffusion_epoch = depoch_list[i]
-        args.diffusion_epoch = depoch_list[i]
-        tmp = main( copy.deepcopy(args_train),  copy.deepcopy(args) )
-        
-        result_list.append(tmp)
-    
-
+    for epoch in depoch_list:
+        args_train.diffusion_epoch = epoch
+        args.diffusion_epoch = epoch
+        result = main(copy.deepcopy(args_train), copy.deepcopy(args))
+        result_list.append(result)
