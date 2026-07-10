@@ -43,8 +43,8 @@ echo "Training started at: $(date)"
 start_time=$(date +%s)
 
 python diffuser/ogb_task/ogb_maze_v1/train_ogb_stgl_sml.py \
---config config/ogb_ant_soc/og_antSoc_Ar_o17d_DiTd768_PadBuf_Ft64_ts512_fs4_h160_ovlp56MditD384.py \
-
+--config="config/ogb_ant_soc/og_antSoc_Ar_o17d_DiTd768_PadBuf_Ft64_ts512_fs4_h160_ovlp56MditD384_kickOS_v1.py" \
+##--config config/ogb_ant_soc/og_antSoc_Ar_o17d_DiTd768_PadBuf_Ft64_ts512_fs4_h160_ovlp56MditD384.py \
 end_time=$(date +%s)
 echo "Training ended at: $(date)"
 

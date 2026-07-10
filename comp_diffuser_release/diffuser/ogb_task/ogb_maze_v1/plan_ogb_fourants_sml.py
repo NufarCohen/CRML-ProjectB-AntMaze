@@ -33,28 +33,32 @@ class Parser(utils.Parser):
     config: str = None
     pl_seeds: str = '-1'
     plan_n_ep: int = -100
+    use_parallel_relay: int = 0
     is_vid_subtitles: int = 1
 
 
 def main(args_train, args):
-    """Run the two-ant sequential handoff planner."""
+    """Run the four-ant sequential relay planner."""
     ld_config = dict()
 
     planner = OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1(args_train, args=args)
     planner.setup_load(ld_config=ld_config)
 
     print(
-        "[TwoAnt Relay Planner]\n"
+        "[FourAnt Relay Planner]\n"
         f"  multi_agent_env_name     = {args.multi_agent_env_name}\n"
+        f"  num_agents               = {args.num_agents}\n"
         f"  ma_mode                  = {args.ma_mode}\n"
+        f"  use_parallel_relay       = {args.use_parallel_relay}\n"
+        f"  is_vid_subtitles         = {args.is_vid_subtitles}\n"
         f"  carrier_order            = {args.carrier_order}\n"
-        f"  handoff_xy               = ({args.handoff_x}, {args.handoff_y})\n"
+        f"  handoff_points           = {args.handoff_points}\n"
+        f"  retreat_points           = {args.retreat_points}\n"
         f"  ball_handoff_threshold   = {args.ball_handoff_threshold}\n"
         f"  ball_goal_threshold      = {args.ball_goal_threshold}\n"
         f"  ep_st_idx                = {args.ep_st_idx}\n"
         f"  n_act_per_waypnt         = {args.n_act_per_waypnt}\n"
         f"  is_replan                = {args.is_replan}\n"
-        f"  is_vid_subtitles         = {args.is_vid_subtitles}\n"
     )
 
     pl_seeds = args.pl_seeds
@@ -115,23 +119,22 @@ def configure_common_eval_args(args, args_train):
     return loadpath
 
 
-def configure_two_ant_soccer_relay(args, args_train):
+def configure_four_ant_soccer_relay(args, args_train):
     """
-    Configure Mode B sequential handoff:
+    Configure Mode B sequential relay for 4 ants:
 
-        Ant1 carries ball to handoff_xy.
-        Ant2 automatically wakes up when ball is inside ball_handoff_threshold.
-        Ant2 carries ball from handoff_xy to final_goal_xy.
+        Ant1 -> x1 -> retreat
+        Ant2 -> x2 -> retreat
+        Ant3 -> x3 -> retreat
+        Ant4 -> final_goal_xy
 
-    Important:
-        final_goal_xy is still loaded from the OGBench eval problem gl_pos[15:17].
-        The handoff point is manually defined here by handoff_x/handoff_y.
+    final_goal_xy is loaded from the OGBench eval problem gl_pos[15:17].
     """
     dfu_ndim = len(args_train.dataset_config['obs_select_dim'])
 
     if 'antsoccer' not in args.dataset.lower():
         raise NotImplementedError(
-            "This launch file is intentionally only for AntSoccer two-ant relay. "
+            "This launch file is intentionally only for AntSoccer multi-ant relay. "
             f"Got dataset={args.dataset}"
         )
 
@@ -146,38 +149,39 @@ def configure_two_ant_soccer_relay(args, args_train):
             f"Expected AntSoccer diffusion dim 4 or 17, got dfu_ndim={dfu_ndim}"
         )
 
-    # Real rollout env: two ants, one ball.
-    args.num_agents = 2
-    args.multi_agent_env_name = "antsoccer-twoants-arena-v0"
+    args.num_agents = 4
+    args.multi_agent_env_name = "antsoccer-fourants-arena-v0"
 
-    # Mode B: only one active carrier at a time.
-    # Ant2 wakes up only after the ball reaches the handoff radius.
-    args.ma_mode = "mode_b_sequential_handoff"
-    args.carrier_order = [1, 2]
+    args.use_parallel_relay = bool(int(getattr(args, "use_parallel_relay", 0)))
+    args.is_vid_subtitles = bool(int(getattr(args, "is_vid_subtitles", 1)))
+
+    if args.use_parallel_relay:
+        args.ma_mode = "mode_d_closest_ant_parallel"
+    else:
+        args.ma_mode = "mode_b_sequential_handoff"
+
+    args.carrier_order = [1, 2, 3, 4]
     args.initial_active_agent_id = 1
 
-    # Manual middle point for the relay.
-    # Change these two numbers to control where Ant1 should bring the ball.
-    args.handoff_x = 12.0
-    args.handoff_y = 12.0
+    # Three intermediate relay points before the dataset final goal.
+    args.handoff_points = [
+        [8.0, 8.0],
+        [12.0, 12.0],
+        [16.0, 16.0],
+    ]
 
-    args.retreat_x = 2.0
-    args.retreat_y = 14.0
+    # Parking spots for ants after they finish their segment.
+    args.retreat_points = [
+        [2.0, 14.0],
+        [2.0, 2.0],
+        [14.0, 2.0],
+    ]
 
-    args.ant1_retreat_threshold = 4.0 
-    # ---------------------------------------------
+    args.retreat_threshold = 4.0
 
-    # Wake-up radius for Ant2.
-    # If Ant2 never wakes up, increase this to 3.5 or 4.0.
-    # If Ant2 wakes too early, decrease this to 2.0 or 2.5.
     args.ball_handoff_threshold = 3.0
-
-    # Success radius around final target.
     args.ball_goal_threshold = 2.0
 
-    # Evaluation problem index.
-    # This picks start_state[i] and final goal_pos[i] from the OGBench HDF5.
-    # It is not itself a coordinate.
     args.ep_st_idx = 88
 
     args.ev_n_comp = 5
@@ -199,17 +203,19 @@ def configure_two_ant_soccer_relay(args, args_train):
     args.inv_epoch = 'latest'
     args.is_inv_train_mode = True
     args.repl_wp_cfg = {}
-    args.is_vid_subtitles = bool(int(getattr(args, "is_vid_subtitles", 1)))
 
     print(
-        "[configure_two_ant_soccer_relay]\n"
+        "[configure_four_ant_soccer_relay]\n"
         f"  dfu_ndim                = {dfu_ndim}\n"
         f"  carrier_order          = {args.carrier_order}\n"
-        f"  handoff_xy             = ({args.handoff_x}, {args.handoff_y})\n"
+        f"  ma_mode                = {args.ma_mode}\n"
+        f"  use_parallel_relay     = {args.use_parallel_relay}\n"
+        f"  is_vid_subtitles       = {args.is_vid_subtitles}\n"
+        f"  handoff_points         = {args.handoff_points}\n"
+        f"  retreat_points         = {args.retreat_points}\n"
         f"  handoff_radius         = {args.ball_handoff_threshold}\n"
         f"  goal_radius            = {args.ball_goal_threshold}\n"
         f"  ep_st_idx              = {args.ep_st_idx}\n"
-        f"  is_vid_subtitles       = {args.is_vid_subtitles}\n"
     )
 
 
@@ -220,7 +226,7 @@ if __name__ == '__main__':
     assert Is_OgB_Robot_Env
 
     loadpath = configure_common_eval_args(args, args_train)
-    configure_two_ant_soccer_relay(args, args_train)
+    configure_four_ant_soccer_relay(args, args_train)
 
     latest_e = utils.get_latest_epoch(loadpath)
     depoch_list = [latest_e]
@@ -230,14 +236,18 @@ if __name__ == '__main__':
     else:
         args.env_n_max_steps = None
 
+    handoff_tag = "-".join(
+        [f"{p[0]:.1f}_{p[1]:.1f}" for p in args.handoff_points]
+    )
+    relay_tag = "closestParallel" if args.use_parallel_relay else "sequential"
     sub_dir = (
         f'{datetime.now().strftime("%y%m%d-%H%M%S-%f")[:-3]}'
-        f'-twoantRelay'
+        f'-fourantRelay-{relay_tag}'
         f'-nm{int(args.plan_n_ep)}'
         f'-ems{args.env_n_max_steps // 1000}k'
         f'-ncp{args.ev_n_comp}'
         f'-{args.ev_cp_infer_t_type}'
-        f'-handoff{args.handoff_x:.1f}_{args.handoff_y:.1f}'
+        f'-handoffs{handoff_tag}'
         f'-rad{args.ball_handoff_threshold:.1f}'
         f'-evSd{",".join([str(sd) for sd in args.pl_seeds])}'
     )

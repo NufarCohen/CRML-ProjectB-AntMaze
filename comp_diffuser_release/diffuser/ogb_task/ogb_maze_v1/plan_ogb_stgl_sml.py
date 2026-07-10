@@ -542,7 +542,7 @@ if __name__ == '__main__':
                 args.ev_cp_infer_t_type = 'interleave'
                 # args.is_use_subgoal_marker = False
                 
-                args.ep_st_idx = 99
+                args.ep_st_idx = 15
                 ## teaser animation vis
                 # args.rd_resol = 1200
                 # args.is_rd_agv = True ## render agent view video

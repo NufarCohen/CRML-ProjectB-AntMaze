@@ -9,7 +9,7 @@ from ogbench.locomaze.humanoid import HumanoidEnv
 from ogbench.locomaze.point import PointEnv
 from ogbench.luo_utils.d4rl_m2d_const import get_str_maze_spec
 import ogbench.utils as utils ; import mujoco
-from ogbench.locomaze.two_ant_utils import make_two_ant_tree
+from ogbench.locomaze.multi_ant_utils import make_multi_ant_tree
 
 
 def make_maze_env(loco_env_type, maze_env_type, num_ants=1, *args, **kwargs):
@@ -167,10 +167,8 @@ def make_maze_env(loco_env_type, maze_env_type, num_ants=1, *args, **kwargs):
             # Update XML file.
             xml_file = self.xml_file
             tree = ET.parse(xml_file)
-            if num_ants ==2:
-                tree = make_two_ant_tree(tree)
-            elif num_ants != 1:
-                raise NotImplementedError(f"Only num_ants=1 or num_ants=2 are supported for now, got {num_ants}")
+            if num_ants > 1:
+                tree = make_multi_ant_tree(tree, num_ants=num_ants)
 
             self.update_tree(tree)
             _, maze_xml_file = tempfile.mkstemp(text=True, suffix='.xml')

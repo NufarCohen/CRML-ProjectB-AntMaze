@@ -93,11 +93,8 @@ config="config/ogb_ant_soc/og_antSoc_Ar_o17d_DiTd768_PadBuf_Ft64_ts512_fs4_h160_
 GPU_ID=${1:-0}
 PLAN_N_EP=${2:-1}
 PL_SEEDS=${3:--1}
-
-
-# ------------------------------------------------------------------
-# Run
-# ------------------------------------------------------------------
+# 4th arg: 1 = burn subtitles into video (default), 0 = off
+VID_SUBTITLES=${4:-1}
 
 PYTHONDONTWRITEBYTECODE=1 \
 CUDA_VISIBLE_DEVICES=${GPU_ID} \
@@ -105,6 +102,7 @@ MUJOCO_EGL_DEVICE_ID=${GPU_ID} \
 python diffuser/ogb_task/ogb_maze_v1/plan_ogb_twoants_sml.py \
     --config "${config}" \
     --plan_n_ep "${PLAN_N_EP}" \
-    --pl_seeds "${PL_SEEDS}"
+    --pl_seeds "${PL_SEEDS}" \
+    --is_vid_subtitles "${VID_SUBTITLES}"
 
 exit 0

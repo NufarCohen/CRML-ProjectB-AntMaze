@@ -23,10 +23,13 @@ from diffuser.ogb_task.ogb_maze_v1.multi_agent_planner_utils import (
     make_single_active_joint_action,
     get_multi_agent_world_state,
     set_multi_agent_env_from_single_agent_obs,
+    overlay_subtitles_on_image,
 )
 from diffuser.ogb_task.ogb_maze_v1.multi_agent_coordinator import (
     MultiAgentRelayCoordinator,
     MultiAgentRelayConfig,
+    ParallelRelayCoordinator,
+    ClosestAntRelayCoordinator,
 )
 
 
@@ -35,13 +38,14 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
     A Class to support evaluation using CompDiffuser.
     This class can be used for OGBench Maze and AntSoccer.
 
-    Multi-agent Mode B behavior:
+    Multi-agent Mode B behavior (N agents):
         1. Ant1 is active.
         2. Ant1 pushes the ball to handoff_xy = (x1, y1).
-        3. Only when the BALL is really close to handoff_xy, Ant2 wakes up.
-        4. Ant2 first goes to the current ball/handoff location.
-        5. Once Ant2 is close enough to the ball, Ant2 pushes the ball to final_goal_xy.
-        6. Done when the BALL is close enough to final_goal_xy.
+        3. Ant1 retreats; Ant2 wakes up when Ant1 is parked.
+        4. Ant2 pushes the ball to (x2, y2), retreats; Ant3 wakes up.
+        5. ... continues through all relay segments ...
+        6. The last ant pushes the ball to final_goal_xy.
+        7. Done when the BALL is close enough to final_goal_xy.
     """
 
     def __init__(self, args_train, args) -> None:
@@ -69,9 +73,7 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
 
         self.handoff_x = float(getattr(args, "handoff_x", 5.0))
         self.handoff_y = float(getattr(args, "handoff_y", 2.0))
-        self.handoff_points = [
-            np.array([self.handoff_x, self.handoff_y], dtype=np.float32)
-        ]
+        self.handoff_points = self._parse_handoff_points(args)
 
         # Final Mode B thresholds.
         # Important: this is the strict BALL-to-handoff radius.
@@ -87,14 +89,25 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
         # Backward compatibility for old logs/code paths.
         self.ball_handoff_threshold = self.handoff_ball_radius
 
+        self.retreat_points = self._parse_retreat_points(args)
+        self.retreat_threshold = float(
+            getattr(args, "retreat_threshold", getattr(args, "ant1_retreat_threshold", 2.0))
+        )
+
         self.relay_coordinator = None
         self.ma_stage_switched_last_update = False
         self.ma_stage_target_xy = self.handoff_points[0].copy()
 
+        # Concurrent relay state; unused by the sequential path.
+        self.parallel_relay_coordinator = None
+        self.closest_ant_relay_coordinator = None
+        self.ma_parallel_stage_switched_last_update = False
+
         utils.print_color(
             f"[MultiAgent Planner] num_agents={self.num_agents}, "
             f"initial_active_agent_id={self.initial_active_agent_id}, "
-            f"multi_agent_env_name={self.multi_agent_env_name}",
+            f"multi_agent_env_name={self.multi_agent_env_name}, "
+            f"handoff_points={self.handoff_points}",
             c="c",
         )
 
@@ -113,6 +126,7 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
         self.rd_resol = getattr(self.args, "rd_resol", 200)
         self.is_use_subgoal_marker = getattr(self.args, "is_use_subgoal_marker", True)
         self.is_rd_agv = getattr(self.args, "is_rd_agv", False)
+        self.is_vid_subtitles = bool(int(getattr(args, "is_vid_subtitles", 1)))
 
         if self.plan_n_ep == 100:
             assert self.ep_st_idx == 0
@@ -145,6 +159,66 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
             self.act_control = "pd_ogb"
         else:
             raise NotImplementedError
+
+    @staticmethod
+    def _parse_handoff_points(args):
+        raw_points = getattr(args, "handoff_points", None)
+        if raw_points is not None:
+            return [np.asarray(p, dtype=np.float32).reshape(2) for p in raw_points]
+
+        expected_handoffs = max(int(getattr(args, "num_agents", 2)) - 1, 0)
+        if expected_handoffs <= 1:
+            handoff_x = float(getattr(args, "handoff_x", 5.0))
+            handoff_y = float(getattr(args, "handoff_y", 2.0))
+            return [np.array([handoff_x, handoff_y], dtype=np.float32)]
+
+        prefix = []
+        for idx in range(1, expected_handoffs + 1):
+            x_key = f"handoff{idx}_x"
+            y_key = f"handoff{idx}_y"
+            if hasattr(args, x_key) and hasattr(args, y_key):
+                prefix.append(
+                    np.array(
+                        [float(getattr(args, x_key)), float(getattr(args, y_key))],
+                        dtype=np.float32,
+                    )
+                )
+
+        if len(prefix) == expected_handoffs:
+            return prefix
+
+        raise ValueError(
+            f"Expected {expected_handoffs} handoff points for "
+            f"num_agents={getattr(args, 'num_agents', 2)}. "
+            "Provide args.handoff_points or handoff1_x/handoff1_y, ..."
+        )
+
+    @staticmethod
+    def _parse_retreat_points(args):
+        raw_points = getattr(args, "retreat_points", None)
+        if raw_points is not None:
+            return [np.asarray(p, dtype=np.float32).reshape(2) for p in raw_points]
+
+        num_agents = int(getattr(args, "num_agents", 2))
+        expected_retreats = max(num_agents - 1, 0)
+        if expected_retreats == 0:
+            return []
+
+        default_positions = [
+            [2.0, 14.0],
+            [2.0, 2.0],
+            [14.0, 2.0],
+            [20.0, 14.0],
+        ]
+
+        retreat_x = float(getattr(args, "retreat_x", default_positions[0][0]))
+        retreat_y = float(getattr(args, "retreat_y", default_positions[0][1]))
+        default_positions[0] = [retreat_x, retreat_y]
+
+        return [
+            np.array(default_positions[idx], dtype=np.float32)
+            for idx in range(expected_retreats)
+        ]
 
     def setup_load(self, ld_config):
         """
@@ -372,6 +446,18 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
             carrier_order=self.carrier_order,
             handoff_points=self.handoff_points,
             final_goal_xy=np.asarray(final_goal_xy, dtype=np.float32),
+            retreat_points=self.retreat_points,
+            retreat_threshold=self.retreat_threshold,
+            retreat_xy=np.array(
+                [
+                    float(getattr(self.args, "retreat_x", self.retreat_points[0][0])),
+                    float(getattr(self.args, "retreat_y", self.retreat_points[0][1])),
+                ],
+                dtype=np.float32,
+            ) if self.retreat_points else None,
+            ant1_retreat_threshold=float(
+                getattr(self.args, "ant1_retreat_threshold", self.retreat_threshold)
+            ),
             ball_handoff_threshold=float(getattr(self.args, "ball_handoff_threshold", 3.0)),
             ball_goal_threshold=self.ball_goal_threshold,
         )
@@ -392,6 +478,84 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
             f"final_goal_xy={np.asarray(final_goal_xy, dtype=np.float32)}, "
             f"handoff_ball_radius={self.handoff_ball_radius}, "
             f"ant2_reach_ball_radius={self.ant2_reach_ball_radius}, "
+            f"ball_goal_threshold={self.ball_goal_threshold}",
+            c="g",
+        )
+
+    def ma_uses_parallel_step(self) -> bool:
+        return self.ma_mode in (
+            "mode_c_parallel_handoff",
+            "mode_d_closest_ant_parallel",
+        )
+
+    def ma_setup_closest_ant_relay_coordinator_for_episode(self, final_goal_xy):
+        config = MultiAgentRelayConfig(
+            carrier_order=self.carrier_order,
+            handoff_points=self.handoff_points,
+            final_goal_xy=np.asarray(final_goal_xy, dtype=np.float32),
+            ball_handoff_threshold=float(
+                getattr(self.args, "ball_handoff_threshold", 3.0)
+            ),
+            ball_goal_threshold=self.ball_goal_threshold,
+        )
+
+        self.closest_ant_relay_coordinator = ClosestAntRelayCoordinator(
+            config=config,
+            mode=self.ma_mode,
+        )
+        self.ma_parallel_stage_switched_last_update = False
+
+        utils.print_color(
+            f"[MA Closest-Ant Relay] setup: "
+            f"mode={self.ma_mode}, "
+            f"num_agents={self.num_agents}, "
+            f"handoff_points={self.handoff_points}, "
+            f"final_goal_xy={np.asarray(final_goal_xy, dtype=np.float32)}, "
+            f"ball_handoff_threshold={float(getattr(self.args, 'ball_handoff_threshold', 3.0))}, "
+            f"ball_goal_threshold={self.ball_goal_threshold}",
+            c="g",
+        )
+
+    def ma_setup_parallel_relay_coordinator_for_episode(self, final_goal_xy):
+        """
+        Concurrent-mode counterpart of ma_setup_relay_coordinator_for_episode.
+        Only used when self.ma_mode == "mode_c_parallel_handoff".
+        """
+        config = MultiAgentRelayConfig(
+            carrier_order=self.carrier_order,
+            handoff_points=self.handoff_points,
+            final_goal_xy=np.asarray(final_goal_xy, dtype=np.float32),
+            # retreat_xy/ant1_retreat_threshold are required by the shared
+            # config dataclass but unused in parallel mode (no retreat step).
+            retreat_points=self.retreat_points,
+            retreat_threshold=self.retreat_threshold,
+            retreat_xy=np.array(
+                [
+                    float(getattr(self.args, "retreat_x", self.retreat_points[0][0] if self.retreat_points else 2.0)),
+                    float(getattr(self.args, "retreat_y", self.retreat_points[0][1] if self.retreat_points else 14.0)),
+                ],
+                dtype=np.float32,
+            ),
+            ant1_retreat_threshold=float(
+                getattr(self.args, "ant1_retreat_threshold", self.retreat_threshold)
+            ),
+            ball_handoff_threshold=float(getattr(self.args, "ball_handoff_threshold", 3.0)),
+            ball_goal_threshold=self.ball_goal_threshold,
+        )
+
+        self.parallel_relay_coordinator = ParallelRelayCoordinator(
+            config=config,
+            mode=self.ma_mode,
+        )
+        self.ma_parallel_stage_switched_last_update = False
+
+        utils.print_color(
+            f"[MA Parallel Relay] setup: "
+            f"mode={self.ma_mode}, "
+            f"carrier_order={self.carrier_order}, "
+            f"handoff_points={self.handoff_points}, "
+            f"final_goal_xy={np.asarray(final_goal_xy, dtype=np.float32)}, "
+            f"ball_handoff_threshold={float(getattr(self.args, 'ball_handoff_threshold', 3.0))}, "
             f"ball_goal_threshold={self.ball_goal_threshold}",
             c="g",
         )
@@ -490,6 +654,165 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
 
         return active_agent_id, active_task
 
+    def ma_get_parallel_tasks(self, update_relay: bool = True) -> dict:
+        """
+        Return per-agent tasks for parallel relay modes (mode_c / mode_d).
+
+        Unlike ma_get_active_task, multiple agents may be active at once.
+        """
+        world_state = self.ma_get_world_state()
+
+        if self.ma_mode == "mode_c_parallel_handoff":
+            coordinator = self.parallel_relay_coordinator
+        elif self.ma_mode == "mode_d_closest_ant_parallel":
+            coordinator = self.closest_ant_relay_coordinator
+        else:
+            raise RuntimeError(f"ma_get_parallel_tasks called with {self.ma_mode=}")
+
+        if update_relay:
+            coordinator.update(world_state)
+            self.ma_parallel_stage_switched_last_update = (
+                coordinator.last_switch_info is not None
+            )
+
+        return coordinator.get_tasks(world_state)
+
+    def ma_format_target_label(self, target_xy) -> str:
+        if target_xy is None:
+            return "?"
+        target_xy = np.asarray(target_xy, dtype=np.float32).reshape(2)
+        return f"({target_xy[0]:.1f}, {target_xy[1]:.1f})"
+
+    def ma_get_ball_target_label(self) -> str:
+        """Human-readable description of where the ball should go next."""
+        if (
+            self.ma_mode == "mode_d_closest_ant_parallel"
+            and self.closest_ant_relay_coordinator is not None
+        ):
+            coord = self.closest_ant_relay_coordinator
+            if coord.done:
+                return "done"
+            if coord.handoff_idx < len(self.handoff_points):
+                return f"handoff {coord.handoff_idx + 1}"
+            return "final goal"
+
+        if self.relay_coordinator is not None:
+            coord = self.relay_coordinator
+            if coord.done:
+                return "done"
+            if coord.phase == "carry":
+                if coord.segment_idx < len(self.handoff_points):
+                    return f"handoff {coord.segment_idx + 1}"
+                return "final goal"
+            if coord.segment_idx < len(self.handoff_points):
+                return f"handoff {coord.segment_idx + 1} (wait)"
+            return "final goal (wait)"
+
+        if len(self.handoff_points) == 1:
+            return "handoff"
+        return f"handoff {len(self.handoff_points)}"
+
+    def ma_format_agent_action_label(
+        self,
+        agent_id: int,
+        role: str = "",
+        stage: str = "",
+    ) -> str:
+        stage = stage or ""
+        role = role or ""
+
+        if "retreat" in stage or role == "agent_retreating":
+            return f"Ant{agent_id}: parking"
+        if role == "move_to_handoff":
+            return f"Ant{agent_id}: going to handoff"
+        if role in ("carry_ball", "carry_ball_to_handoff", "carry_ball_to_final"):
+            if "to_final" in stage or role == "carry_ball_to_final":
+                return f"Ant{agent_id}: carrying ball to goal"
+            if "to_handoff" in stage:
+                handoff_num = stage.rsplit("_", 1)[-1]
+                if handoff_num.isdigit():
+                    return f"Ant{agent_id}: carrying ball to handoff {handoff_num}"
+            return f"Ant{agent_id}: carrying ball"
+        if "to_final" in stage:
+            return f"Ant{agent_id}: carrying ball to goal"
+        if "to_handoff" in stage:
+            handoff_num = stage.rsplit("_", 1)[-1]
+            if handoff_num.isdigit():
+                return f"Ant{agent_id}: carrying ball to handoff {handoff_num}"
+            return f"Ant{agent_id}: carrying ball"
+        if "handoff" in stage:
+            return f"Ant{agent_id}: carrying ball"
+
+        return f"Ant{agent_id}: active"
+
+    def ma_get_relay_subtitle_lines(
+        self,
+        tasks=None,
+        active_agent_id=None,
+        active_task=None,
+    ):
+        mode_label = {
+            "mode_b_sequential_handoff": "Sequential relay",
+            "mode_d_closest_ant_parallel": "Closest-ant relay",
+            "mode_c_parallel_handoff": "Parallel relay",
+        }.get(self.ma_mode, self.ma_mode)
+
+        lines = [f"{mode_label} | Ball -> {self.ma_get_ball_target_label()}"]
+
+        if self.ma_uses_parallel_step() and tasks is not None:
+            active_parts = []
+            for agent_id in self.carrier_order:
+                task = tasks.get(agent_id, {})
+                if not task.get("active", False) or task.get("frozen", False):
+                    continue
+                active_parts.append(
+                    self.ma_format_agent_action_label(
+                        agent_id,
+                        role=task.get("role", ""),
+                        stage=task.get("stage_name", ""),
+                    )
+                )
+
+            if len(active_parts) == 1:
+                lines.append(active_parts[0])
+            elif active_parts:
+                lines.append(" | ".join(active_parts))
+            else:
+                lines.append("Waiting")
+            return lines
+
+        if active_agent_id is None:
+            lines.append("Done" if active_task and active_task.get("is_done") else "Waiting")
+            return lines
+
+        stage = active_task.get("stage") or active_task.get("stage_name", "")
+        role = active_task.get("role", "")
+        lines.append(
+            self.ma_format_agent_action_label(
+                active_agent_id,
+                role=role,
+                stage=stage,
+            )
+        )
+        return lines
+
+    def ma_render_frame_with_subtitles(
+        self,
+        tasks=None,
+        active_agent_id=None,
+        active_task=None,
+    ):
+        img = self.base_env.render()
+        if not self.is_vid_subtitles:
+            return img
+
+        lines = self.ma_get_relay_subtitle_lines(
+            tasks=tasks,
+            active_agent_id=active_agent_id,
+            active_task=active_task,
+        )
+        return overlay_subtitles_on_image(img, lines, font_size=11)
+
     def ma_build_stage_goal_obs(self, base_goal_obs: np.ndarray, active_task: dict) -> np.ndarray:
         """
         Builds a goal observation where BOTH the ant position and ball position 
@@ -501,14 +824,259 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
             return goal_obs
 
         target_xy = active_task.get("target_xy", None)
+        stage_name = active_task.get("stage_name", "")
+
         if target_xy is not None:
             target_xy = np.asarray(target_xy, dtype=np.float32).reshape(2)
             
-            goal_obs[0:2] = target_xy
-            
-            goal_obs[15:17] = target_xy
+            if stage_name.endswith("_retreat") or stage_name == "ant1_retreat":
+                goal_obs[0:2] = target_xy
+                goal_obs[15:17] = goal_obs[15:17]
+            elif (
+                active_task.get("role") == "move_to_handoff"
+                or "_meet_" in stage_name
+            ):
+                goal_obs[0:2] = target_xy
+            else:
+                goal_obs[0:2] = target_xy
+                goal_obs[15:17] = target_xy
 
         return goal_obs
+
+    def ma_run_parallel_step(
+        self,
+        i_ep,
+        i_et,
+        gl_pos,
+        n_comp_full,
+        fused_traj_ep_by_agent,
+        all_plan_trajs_ep_by_agent,
+        cnt_repl_by_agent,
+        prev_dfu_wp_idx_by_agent,
+        prev_n_comp_by_agent,
+        goal_cur_by_agent,
+        last_pick_traj_by_agent,
+        is_suc,
+        total_reward,
+        cnt_extras,
+        rollout,
+        imgs_rout,
+        imgs_rout_agv,
+    ):
+        """
+        One env timestep of the concurrent (mode_c_parallel_handoff) relay:
+        both agents are independently planned/replanned/followed (each
+        keeping its own fused_traj_ep/wp-tracking state), then a single
+        joint action drives one self.base_env.step() call.
+
+        Mirrors the per-agent body of the sequential loop
+        (ogb_plan_once, lines ~787-1063) but looped over both agents;
+        does not call/modify ma_get_active_task or the sequential
+        relay_coordinator.
+        """
+        tasks = self.ma_get_parallel_tasks(update_relay=True)
+        force_stage_replan = bool(
+            getattr(self, "ma_parallel_stage_switched_last_update", False)
+        )
+
+        wp_idx = i_et // self.n_act_per_waypnt
+        is_wp_not_start = (wp_idx * self.n_act_per_waypnt) == i_et
+
+        if i_et % 50 == 0:
+            world_state_dbg = self.ma_get_world_state()
+            utils.print_color(
+                f"[MA PARALLEL STATE DEBUG] {i_ep=} {i_et=} "
+                f"agent_xy={world_state_dbg['agent_xy']} "
+                f"ball_xy={world_state_dbg['ball_xy']} "
+                f"stages={ {aid: (t['stage_name'], t.get('frozen')) for aid, t in tasks.items()} }",
+                c="m",
+            )
+
+        actions_by_agent = {}
+
+        for agent_id in self.carrier_order:
+            task = tasks[agent_id]
+
+            if not task.get("active", False) or task.get("frozen", True):
+                actions_by_agent[agent_id] = None
+                continue
+
+            raw_obs_cur = self.base_env.get_ob().copy()
+            obs_cur = get_agent_single_obs_from_multi_obs(
+                raw_obs_cur,
+                layout=self.ma_layout,
+                agent_id=agent_id,
+            )
+            obs_cur_nm = self.full_normalizer.normalize(obs_cur, "observations")
+
+            fused_traj_ep = fused_traj_ep_by_agent[agent_id]
+            all_plan_trajs_ep = all_plan_trajs_ep_by_agent[agent_id]
+            cnt_repl = cnt_repl_by_agent[agent_id]
+
+            force_replan = force_stage_replan
+            if self.ma_mode == "mode_c_parallel_handoff":
+                force_replan = force_stage_replan and agent_id == self.carrier_order[1]
+
+            if i_et > 0 and agent_id in goal_cur_by_agent:
+                ada_used_dist = np.linalg.norm(
+                    obs_cur[self.obs_select_dim,][self.ada_dist_used_idxs,]
+                    - goal_cur_by_agent[agent_id][self.ada_dist_used_idxs,]
+                )
+            else:
+                ada_used_dist = None
+
+            if self.is_replan == "at_given_t":
+                is_do_repl_et = wp_idx in self.repl_wp_cfg
+            elif self.is_replan == "ada_dist" and ada_used_dist is not None:
+                repl_ada_cond_1 = ada_used_dist > self.ada_dist_thres
+                prev_dfu_wp_idx = prev_dfu_wp_idx_by_agent.get(agent_id, 0)
+                prev_traj_len = len(all_plan_trajs_ep[-1]) if all_plan_trajs_ep else 0
+                repl_ada_cond_2 = (
+                    wp_idx - prev_dfu_wp_idx - self.ada_dist_cond_2_extra
+                ) > prev_traj_len
+                is_do_repl_et = (
+                    repl_ada_cond_1 or repl_ada_cond_2
+                ) and cnt_repl < self.ada_dist_max_n_repl
+            else:
+                is_do_repl_et = False
+
+            is_do_repl_et = is_do_repl_et and is_wp_not_start
+
+            if force_replan:
+                is_do_repl_et = True
+
+            if i_et == 0 or is_do_repl_et:
+                input_st = obs_cur[self.obs_select_dim,]
+
+                stage_goal_obs = self.ma_build_stage_goal_obs(
+                    base_goal_obs=gl_pos,
+                    active_task=task,
+                )
+                gl_pos_for_dfu = stage_goal_obs[self.obs_select_dim,]
+
+                g_cond = {
+                    "st_gl": np.array(
+                        [input_st[None,], gl_pos_for_dfu[None,]],
+                        dtype=np.float32,
+                    )
+                }
+
+                if is_do_repl_et and i_et > 0:
+                    cnt_repl += 1
+
+                    if self.is_replan == "at_given_t":
+                        self.policy.n_comp = self.repl_wp_cfg[wp_idx]
+
+                    elif self.is_replan == "ada_dist":
+                        if self.ada_dist_type == "m_1":
+                            raise NotImplementedError
+
+                        elif self.ada_dist_type == "m_2":
+                            if (
+                                agent_id not in prev_dfu_wp_idx_by_agent
+                                or not all_plan_trajs_ep
+                            ):
+                                tmp_n_comp = n_comp_full
+                            else:
+                                prev_dfu_wp_idx = prev_dfu_wp_idx_by_agent[agent_id]
+                                prev_n_comp = prev_n_comp_by_agent.get(
+                                    agent_id, n_comp_full
+                                )
+                                tmp_cnt_wp = wp_idx - prev_dfu_wp_idx
+                                tmp_v1 = max(0, (tmp_cnt_wp - self.ada_dist_minus_n_wp))
+                                prev_hzn = len(all_plan_trajs_ep[-1])
+                                tmp_n_comp = math.ceil(
+                                    (1 - tmp_v1 / prev_hzn) * prev_n_comp
+                                )
+                                tmp_n_comp = max(1, tmp_n_comp)
+
+                        self.policy.n_comp = tmp_n_comp
+                    else:
+                        raise NotImplementedError
+                else:
+                    self.policy.n_comp = n_comp_full
+
+                m_out = self.policy.gen_cond_stgl(
+                    g_cond=g_cond,
+                    b_s=self.b_size_per_prob,
+                )
+                pick_traj = m_out.pick_traj
+
+                utils.print_color(f"[ Run Parallel Planner ] {i_et=} {wp_idx=} {agent_id=}", c="y")
+
+                tmp_tj_end_idx = wp_idx + len(pick_traj)
+                if tmp_tj_end_idx > len(fused_traj_ep):
+                    pick_traj = pick_traj[: len(fused_traj_ep) - wp_idx]
+                    tmp_tj_end_idx = wp_idx + len(pick_traj)
+
+                fused_traj_ep[wp_idx:tmp_tj_end_idx] = pick_traj
+                fused_traj_ep[tmp_tj_end_idx:] = pick_traj[-1]
+
+                all_plan_trajs_ep.append(pick_traj)
+                last_pick_traj_by_agent[agent_id] = pick_traj
+
+                prev_dfu_wp_idx_by_agent[agent_id] = wp_idx
+                prev_n_comp_by_agent[agent_id] = self.policy.n_comp
+                cnt_repl_by_agent[agent_id] = cnt_repl
+
+            wp_idx_clamped = min(wp_idx, len(fused_traj_ep) - 1)
+            goal_cur = fused_traj_ep[wp_idx_clamped]
+            goal_cur_by_agent[agent_id] = goal_cur.copy()
+
+            if self.is_use_subgoal_marker:
+                self.base_env.set_subgoal_waypnt(goal_cur[:2])
+
+            goal_cur_nm = self.train_normalizer.normalize(goal_cur, "observations")
+
+            obs_cur_nm_t = utils.to_torch(obs_cur_nm)[None,]
+            goal_cur_nm_t = utils.to_torch(goal_cur_nm)[None,]
+            act_pred_nm = self.inv_model(obs_cur_nm_t, goal_cur_nm_t).cpu().numpy()[0]
+            act_pred = self.full_normalizer.unnormalize(act_pred_nm, "actions")
+
+            actions_by_agent[agent_id] = act_pred
+
+        joint_action = compose_multi_agent_action(actions_by_agent, self.ma_layout)
+
+        if i_et % 50 == 0:
+            utils.print_color(
+                f"[MA PARALLEL ACTION DEBUG] {i_ep=} {i_et=} "
+                f"norm_ant1={np.linalg.norm(joint_action[:8]):.3f} "
+                f"norm_ant2={np.linalg.norm(joint_action[8:16]):.3f}",
+                c="m",
+            )
+
+        raw_obs_cur, rew, terminated, truncated, info = self.base_env.step(joint_action)
+
+        is_suc = bool(info["success"]) or is_suc
+        total_reward += rew
+
+        rollout.append(self.base_env.get_qpos_qvel())
+        subtitle_tasks = self.ma_get_parallel_tasks(update_relay=False)
+        imgs_rout.append(
+            self.ma_render_frame_with_subtitles(tasks=subtitle_tasks)
+        )
+
+        if self.is_rd_agv:
+            imgs_rout_agv.append(self.render_agv_img())
+
+        do_break = False
+        if self.ma_mode == "mode_d_closest_ant_parallel":
+            if self.closest_ant_relay_coordinator.is_done():
+                utils.print_color(
+                    f"[MA Closest Relay] done at {i_ep=} {i_et=}. Ending episode.",
+                    c="g",
+                )
+                is_suc = True
+                total_reward += 1.0
+                do_break = True
+
+        if is_suc:
+            utils.print_color(f"{i_ep=} {i_et=} {is_suc=}")
+            cnt_extras += 1
+            if cnt_extras == 30:
+                do_break = True
+
+        return is_suc, total_reward, cnt_extras, do_break
 
     def ogb_env_interact_1_ep(self, pick_traj, start_state, target):
         """
@@ -672,7 +1240,12 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
                 self.base_env.set_ball_start_marker(st_state[(15, 16),])
 
                 final_goal_xy = gl_pos[(15, 16),]
-                self.ma_setup_relay_coordinator_for_episode(final_goal_xy=final_goal_xy)
+                if self.ma_mode == "mode_c_parallel_handoff":
+                    self.ma_setup_parallel_relay_coordinator_for_episode(final_goal_xy=final_goal_xy)
+                elif self.ma_mode == "mode_d_closest_ant_parallel":
+                    self.ma_setup_closest_ant_relay_coordinator_for_episode(final_goal_xy=final_goal_xy)
+                else:
+                    self.ma_setup_relay_coordinator_for_episode(final_goal_xy=final_goal_xy)
             else:
                 self.base_env.set_goal(goal_xy=gl_pos[:2])
 
@@ -697,11 +1270,16 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
 
             self.base_env.set_start_marker(st_state_mj[:2])
 
+            if self.ma_uses_parallel_step():
+                _init_active_agent_id = self.carrier_order[0]
+            else:
+                _init_active_agent_id = self.ma_get_current_active_agent_id(update_relay=False)
+
             raw_obs_cur = self.base_env.get_ob().copy()
             obs_cur = get_agent_single_obs_from_multi_obs(
                 raw_obs_cur,
                 layout=self.ma_layout,
-                agent_id=self.ma_get_current_active_agent_id(update_relay=False),
+                agent_id=_init_active_agent_id,
             )
             self.check_obs_dim(obs_cur, "obs")
 
@@ -776,7 +1354,45 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
             wp_idx = 0
             cnt_repl = 0
 
+            if self.ma_uses_parallel_step():
+                fused_traj_ep_by_agent = {
+                    aid: np.zeros(shape=(tot_hzn, self.dfu_ndim), dtype=np.float32)
+                    for aid in self.carrier_order
+                }
+                all_plan_trajs_ep_by_agent = {aid: [] for aid in self.carrier_order}
+                cnt_repl_by_agent = {aid: 0 for aid in self.carrier_order}
+                prev_dfu_wp_idx_by_agent = {}
+                prev_n_comp_by_agent = {}
+                goal_cur_by_agent = {}
+                last_pick_traj_by_agent = {}
+
             for i_et in range(self.n_max_steps):
+                if self.ma_uses_parallel_step():
+                    is_suc, total_reward, cnt_extras, do_break = self.ma_run_parallel_step(
+                        i_ep=i_ep,
+                        i_et=i_et,
+                        gl_pos=gl_pos,
+                        n_comp_full=n_comp_full,
+                        fused_traj_ep_by_agent=fused_traj_ep_by_agent,
+                        all_plan_trajs_ep_by_agent=all_plan_trajs_ep_by_agent,
+                        cnt_repl_by_agent=cnt_repl_by_agent,
+                        prev_dfu_wp_idx_by_agent=prev_dfu_wp_idx_by_agent,
+                        prev_n_comp_by_agent=prev_n_comp_by_agent,
+                        goal_cur_by_agent=goal_cur_by_agent,
+                        last_pick_traj_by_agent=last_pick_traj_by_agent,
+                        is_suc=is_suc,
+                        total_reward=total_reward,
+                        cnt_extras=cnt_extras,
+                        rollout=rollout,
+                        imgs_rout=imgs_rout,
+                        imgs_rout_agv=imgs_rout_agv,
+                    )
+                    wp_idx = i_et // self.n_act_per_waypnt
+                    score = 0
+                    if do_break:
+                        break
+                    continue
+
                 # Update relay exactly once per env timestep and reuse active_agent_id.
                 active_agent_id, active_task = self.ma_get_active_task(update_relay=True)
                 force_ma_stage_replan = bool(
@@ -960,10 +1576,26 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
                     wp_idx = min(wp_idx, len(fused_traj_ep) - 1)
 
                     goal_cur = fused_traj_ep[wp_idx]
-                    goal_cur_nm = self.train_normalizer.normalize(goal_cur, "observations")
+
+                    subgoal_xy = goal_cur[:2].copy()
+                    current_stage_name = active_task.get("stage_name", "")
+                    if active_agent_id == 2 and current_stage_name in ["ant2_to_handoff", "ant2_to_final"]:
+                        world_state = self.ma_get_world_state()
+                        ant1_xy = world_state["agent_xy"][1]
+                        ant2_xy = world_state["agent_xy"][2]
+
+                        dist_between_ants = np.linalg.norm(ant2_xy - ant1_xy)
+                        if dist_between_ants < 3.0:
+                            repulsion_vector = ant2_xy - ant1_xy
+                            repulsion_vector = repulsion_vector / (np.linalg.norm(repulsion_vector) + 1e-5)
+
+                            subgoal_xy += repulsion_vector * 1.5
+                    # --------------------------------------------------
 
                     if self.is_use_subgoal_marker:
-                        self.base_env.set_subgoal_waypnt(goal_cur[:2])
+                        self.base_env.set_subgoal_waypnt(subgoal_xy)
+
+                    goal_cur_nm = self.train_normalizer.normalize(goal_cur, "observations")
 
                     obs_cur_nm = utils.to_torch(obs_cur_nm)[None,]
                     goal_cur_nm = utils.to_torch(goal_cur_nm)[None,]
@@ -1027,7 +1659,13 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
                     )
 
                 rollout.append(self.base_env.get_qpos_qvel())
-                imgs_rout.append(self.base_env.render())
+                post_task_agent_id, post_task = self.ma_get_active_task(update_relay=False)
+                imgs_rout.append(
+                    self.ma_render_frame_with_subtitles(
+                        active_agent_id=post_task_agent_id,
+                        active_task=post_task,
+                    )
+                )
 
                 if self.is_rd_agv:
                     imgs_rout_agv.append(self.render_agv_img())
@@ -1037,6 +1675,21 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
                     cnt_extras += 1
                     if cnt_extras == 30:
                         break
+
+            if self.ma_uses_parallel_step():
+                if self.ma_mode == "mode_d_closest_ant_parallel":
+                    _report_agent_id = self.closest_ant_relay_coordinator.carrier_id
+                    if _report_agent_id is None:
+                        _report_agent_id = self.carrier_order[0]
+                else:
+                    _report_agent_id = self.carrier_order[1]
+                fused_traj_ep = fused_traj_ep_by_agent[_report_agent_id]
+                all_plan_trajs_ep = all_plan_trajs_ep_by_agent[_report_agent_id]
+                cnt_repl = cnt_repl_by_agent[_report_agent_id]
+                pick_traj = last_pick_traj_by_agent.get(
+                    _report_agent_id,
+                    last_pick_traj_by_agent.get(self.carrier_order[0]),
+                )
 
             ep_all_plan_trajs_100[i_ep] = all_plan_trajs_ep
 
@@ -1332,9 +1985,13 @@ class OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1:
                 ("ep_st_idx", self.ep_st_idx),
                 ("hostname", socket.gethostname()),
                 ("ma_mode", self.ma_mode),
+                ("use_parallel_relay", self.ma_mode == "mode_d_closest_ant_parallel"),
+                ("is_vid_subtitles", self.is_vid_subtitles),
                 ("num_agents", self.num_agents),
                 ("carrier_order", self.carrier_order),
                 ("handoff_points", [p.tolist() for p in self.handoff_points]),
+                ("retreat_points", [p.tolist() for p in self.retreat_points]),
+                ("retreat_threshold", self.retreat_threshold),
                 ("handoff_ball_radius", self.handoff_ball_radius),
                 ("ant2_reach_ball_radius", self.ant2_reach_ball_radius),
                 ("ball_goal_threshold", self.ball_goal_threshold),

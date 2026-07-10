@@ -37,14 +37,14 @@ class Parser(utils.Parser):
 
 
 def main(args_train, args):
-    """Run the two-ant sequential handoff planner."""
+    """Run the two-ant concurrent (parallel) handoff planner."""
     ld_config = dict()
 
     planner = OgB_Stgl_Sml_MultiAgents_MazeEnvPlanner_V1(args_train, args=args)
     planner.setup_load(ld_config=ld_config)
 
     print(
-        "[TwoAnt Relay Planner]\n"
+        "[TwoAnt Parallel Relay Planner]\n"
         f"  multi_agent_env_name     = {args.multi_agent_env_name}\n"
         f"  ma_mode                  = {args.ma_mode}\n"
         f"  carrier_order            = {args.carrier_order}\n"
@@ -115,13 +115,20 @@ def configure_common_eval_args(args, args_train):
     return loadpath
 
 
-def configure_two_ant_soccer_relay(args, args_train):
+def configure_two_ant_soccer_relay_parallel(args, args_train):
     """
-    Configure Mode B sequential handoff:
+    Configure Mode C concurrent handoff:
 
-        Ant1 carries ball to handoff_xy.
-        Ant2 automatically wakes up when ball is inside ball_handoff_threshold.
-        Ant2 carries ball from handoff_xy to final_goal_xy.
+        Ant1 carries ball to handoff_xy, then freezes once the ball
+        arrives (no retreat step -- Ant2 is never blocked by Ant1).
+        Ant2 walks toward handoff_xy immediately from timestep 0 (to
+        arrive early and wait), then switches its target to
+        final_goal_xy once the ball reaches handoff_xy.
+
+    This is a speed-only variant of configure_two_ant_soccer_relay
+    (mode_b_sequential_handoff): both ants move from the start instead
+    of Ant2 waiting idle until Ant1 finishes and retreats. It is
+    unrelated to ant-ant collision avoidance.
 
     Important:
         final_goal_xy is still loaded from the OGBench eval problem gl_pos[15:17].
@@ -150,9 +157,8 @@ def configure_two_ant_soccer_relay(args, args_train):
     args.num_agents = 2
     args.multi_agent_env_name = "antsoccer-twoants-arena-v0"
 
-    # Mode B: only one active carrier at a time.
-    # Ant2 wakes up only after the ball reaches the handoff radius.
-    args.ma_mode = "mode_b_sequential_handoff"
+    # Mode C: both agents active from timestep 0, no retreat step.
+    args.ma_mode = "mode_c_parallel_handoff"
     args.carrier_order = [1, 2]
     args.initial_active_agent_id = 1
 
@@ -161,15 +167,9 @@ def configure_two_ant_soccer_relay(args, args_train):
     args.handoff_x = 12.0
     args.handoff_y = 12.0
 
-    args.retreat_x = 2.0
-    args.retreat_y = 14.0
-
-    args.ant1_retreat_threshold = 4.0 
-    # ---------------------------------------------
-
-    # Wake-up radius for Ant2.
-    # If Ant2 never wakes up, increase this to 3.5 or 4.0.
-    # If Ant2 wakes too early, decrease this to 2.0 or 2.5.
+    # Wake-up radius for Ant2's target switch (handoff -> final goal).
+    # If Ant2 switches too early/late, adjust this the same way as in
+    # the sequential launch file.
     args.ball_handoff_threshold = 3.0
 
     # Success radius around final target.
@@ -202,7 +202,7 @@ def configure_two_ant_soccer_relay(args, args_train):
     args.is_vid_subtitles = bool(int(getattr(args, "is_vid_subtitles", 1)))
 
     print(
-        "[configure_two_ant_soccer_relay]\n"
+        "[configure_two_ant_soccer_relay_parallel]\n"
         f"  dfu_ndim                = {dfu_ndim}\n"
         f"  carrier_order          = {args.carrier_order}\n"
         f"  handoff_xy             = ({args.handoff_x}, {args.handoff_y})\n"
@@ -220,7 +220,7 @@ if __name__ == '__main__':
     assert Is_OgB_Robot_Env
 
     loadpath = configure_common_eval_args(args, args_train)
-    configure_two_ant_soccer_relay(args, args_train)
+    configure_two_ant_soccer_relay_parallel(args, args_train)
 
     latest_e = utils.get_latest_epoch(loadpath)
     depoch_list = [latest_e]
@@ -232,7 +232,7 @@ if __name__ == '__main__':
 
     sub_dir = (
         f'{datetime.now().strftime("%y%m%d-%H%M%S-%f")[:-3]}'
-        f'-twoantRelay'
+        f'-twoantParallelRelay'
         f'-nm{int(args.plan_n_ep)}'
         f'-ems{args.env_n_max_steps // 1000}k'
         f'-ncp{args.ev_n_comp}'

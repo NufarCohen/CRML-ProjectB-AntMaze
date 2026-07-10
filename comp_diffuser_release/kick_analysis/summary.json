@@ -166,7 +166,9 @@
       "top_ball_speed_events.csv",
       "top_ball_movement_events.csv",
       "top_ball_speed_gain_events.csv",
-      "kick_like_events.csv"
+      "kick_like_events.csv",
+      "all_kick_like_indices.npy",
+      "all_kick_like_state_indices.npy"
     ]
   }
 }

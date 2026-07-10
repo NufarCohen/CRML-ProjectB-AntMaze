@@ -1,4 +1,5 @@
 from collections import namedtuple
+import os
 import numpy as np
 import torch, pdb, random, math
 
@@ -165,6 +166,34 @@ class OgB_SeqDataset_V2(torch.utils.data.Dataset):
         self.indices = self.make_indices(fields.path_lengths, horizon)
         self.len_indices = len(self.indices)
 
+        # ------------------------------------------------------------
+        # Optional kick-aware oversampling.
+        # ------------------------------------------------------------
+        self.kick_indices_path = self.dataset_config.get('kick_indices_path', None)
+        self.kick_oversample_prob = float(self.dataset_config.get('kick_oversample_prob', 0.0))
+        self.kick_window_margin = int(self.dataset_config.get('kick_window_margin', 20))
+        self.kick_candidate_indices = None
+
+        if self.kick_indices_path is not None and self.kick_oversample_prob > 0:
+            if not os.path.exists(self.kick_indices_path):
+                raise FileNotFoundError(
+                    f"[KickOS] kick_indices_path does not exist: {self.kick_indices_path}"
+                )
+
+            raw_kick_indices = np.load(self.kick_indices_path).astype(np.int64)
+            self.kick_candidate_indices = self._make_kick_candidate_indices(
+                raw_kick_indices=raw_kick_indices,
+                horizon=horizon,
+            )
+
+            print(
+                f"[KickOS] enabled | "
+                f"raw_kick_indices={len(raw_kick_indices)} | "
+                f"kick_candidate_windows={len(self.kick_candidate_indices)} | "
+                f"kick_oversample_prob={self.kick_oversample_prob} | "
+                f"kick_window_margin={self.kick_window_margin}"
+            )
+
         self.observation_dim = fields.observations.shape[-1]
         self.action_dim = fields.actions.shape[-1]
         self.fields = fields
@@ -247,12 +276,88 @@ class OgB_SeqDataset_V2(torch.utils.data.Dataset):
                 self.horizon - 1: observations[-1],
             }
 
+    def _make_kick_candidate_indices(self, raw_kick_indices, horizon):
+        """
+        Convert global flat kick timestep indices into dataset sample indices.
+
+        self.indices is expected to contain rows of:
+            (path_ind, start, end)
+
+        A window is considered a kick window if it contains at least one
+        raw kick index t.
+
+        Because the replay buffer is shaped as:
+            [n_episodes, max_path_length, ...]
+        the global flat index of an element is approximately:
+            path_ind * max_path_length + local_t
+
+        This matches the original npz flattening when episodes have fixed
+        max_path_length. For this dataset we observed 1,005,000 rows and
+        5,000 terminal boundaries, i.e. about 201 steps per episode in the
+        raw file; the buffer may pad to max_path_length, so we also keep this
+        logic conservative and validate by producing candidates only.
+        """
+        if raw_kick_indices is None or len(raw_kick_indices) == 0:
+            print("[KickOS] no raw kick indices were provided")
+            return np.array([], dtype=np.int64)
+
+        raw_kick_indices = np.asarray(raw_kick_indices, dtype=np.int64)
+
+        candidate_dataset_indices = []
+
+        # Build intervals in global flat coordinates for every training window.
+        # self.indices[j] = (path_ind, start, end)
+        for j, index_row in enumerate(self.indices):
+            path_ind, start, end = index_row
+
+            path_ind = int(path_ind)
+            start = int(start)
+            end = int(end)
+
+            global_start = path_ind * self.max_path_length + start
+            global_end = path_ind * self.max_path_length + end
+
+            # Allow a small margin so the kick is not always at the exact edge.
+            global_start_with_margin = global_start + self.kick_window_margin
+            global_end_with_margin = global_end - self.kick_window_margin
+
+            if global_end_with_margin <= global_start_with_margin:
+                global_start_with_margin = global_start
+                global_end_with_margin = global_end
+
+            left = np.searchsorted(raw_kick_indices, global_start_with_margin, side='left')
+            right = np.searchsorted(raw_kick_indices, global_end_with_margin, side='right')
+
+            if right > left:
+                candidate_dataset_indices.append(j)
+
+        candidate_dataset_indices = np.asarray(candidate_dataset_indices, dtype=np.int64)
+
+        if len(candidate_dataset_indices) == 0:
+            print(
+                "[KickOS] WARNING: no kick candidate windows were found. "
+                "Training will continue without effective kick oversampling. "
+                "This may mean global indexing does not match replay-buffer indexing."
+            )
+
+        return candidate_dataset_indices
+    
     def __len__(self):
         # return len(self.indices) ## ori
         return len(self.indices) * self.dset_size_scale ## default 1
 
     def __getitem__(self, idx, eps=1e-4):
-        
+                # Optional kick-aware oversampling:
+        # with probability kick_oversample_prob, replace the requested
+        # dataset index by a randomly selected kick-containing window.
+        if (
+            self.kick_candidate_indices is not None
+            and len(self.kick_candidate_indices) > 0
+            and self.kick_oversample_prob > 0
+            and np.random.rand() < self.kick_oversample_prob
+        ):
+            idx = int(np.random.choice(self.kick_candidate_indices))
+            
         if True:
             idx = idx % self.len_indices
 

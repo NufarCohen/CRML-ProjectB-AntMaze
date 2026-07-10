@@ -338,3 +338,41 @@ def set_multi_agent_env_from_single_agent_obs(
 
     env.set_state(qpos, qvel)
     return env.get_ob().copy()
+
+
+def overlay_subtitles_on_image(img: np.ndarray, lines, font_size: int = 11) -> np.ndarray:
+    """Draw compact multi-line subtitles at the top of a rendered RGB frame."""
+    if not lines:
+        return img
+
+    img = np.asarray(img)
+    if img.dtype != np.uint8:
+        if img.max() <= 1.0:
+            img = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
+        else:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    pil_img = Image.fromarray(img)
+    draw = ImageDraw.Draw(pil_img)
+
+    try:
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            font_size,
+        )
+    except OSError:
+        font = ImageFont.load_default()
+
+    line_gap = 2
+    x, y = 6, 4
+    for i, line in enumerate(lines):
+        if not line:
+            continue
+        # subtle shadow for readability
+        draw.text((x + 1, y + 1), line, fill=(0, 0, 0), font=font)
+        draw.text((x, y), line, fill=(255, 255, 255), font=font)
+        y += font_size + line_gap
+
+    return np.asarray(pil_img)

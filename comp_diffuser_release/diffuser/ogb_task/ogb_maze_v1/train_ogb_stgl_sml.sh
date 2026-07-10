@@ -16,7 +16,7 @@
 ##SBATCH --qos="debug"
 #SBATCH --qos="short"
 ##SBATCH --time=100:00:00
-#SBATCH --time=48:00:00
+
 
 source ~/.bashrc
 source activate compdfu_ogb_release
@@ -58,8 +58,10 @@ source activate compdfu_ogb_release
 
 
 ## --------- Training: OGBench AntSoccer Stitch 2D Planner ----------
-config="config/ogb_ant_soc/og_antSoc_Ar_o17d_DiTd768_PadBuf_Ft64_ts512_fs4_h160_ovlp56MditD384.py"
+#config="config/ogb_ant_soc/og_antSoc_Ar_o17d_DiTd768_PadBuf_Ft64_ts512_fs4_h160_ovlp56MditD384.py"
 # config="config/ogb_ant_soc/og_antSoc_Me_o17d_DiTd768_PadBuf_Ft64_MaxOriPlen200_ts512_fs4_h160_ovlp56MditD384.py"
+#---kick-aware oversampling
+config="config/ogb_ant_soc/og_antSoc_Ar_o17d_DiTd768_PadBuf_Ft64_ts512_fs4_h160_ovlp56MditD384_kickOS_v1.py"
 
 {
 
