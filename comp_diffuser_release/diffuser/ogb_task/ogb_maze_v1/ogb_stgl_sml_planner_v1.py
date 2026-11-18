@@ -659,14 +659,61 @@ class OgB_Stgl_Sml_MazeEnvPlanner_V1:
                                 tmp_v1 = max(0, (tmp_cnt_wp - self.ada_dist_minus_n_wp)) 
                                 prev_hzn = len(all_plan_trajs_ep[-1])
                                 tmp_n_comp = math.ceil( (1 - tmp_v1 / prev_hzn) * prev_n_comp )
-                                ## BUG FIX
-                                tmp_n_comp = max(1, tmp_n_comp)
-                                tmp_cur_hzn = self.get_comp_hzn(num_comp=tmp_n_comp)
+                                ## Original planner allowed adaptive replanning
+                                ## to collapse all the way to K=1.  That is fine
+                                ## for ordinary goal-reaching, but soccer
+                                ## release/separation needs future trajectory
+                                ## after contact.  Keep at least K=2 only when
+                                ## training-free soccer guidance is enabled.
+                                soccer_guidance_on = bool(
+                                    getattr(
+                                        self.policy.diffusion_model,
+                                        'soccer_guidance_enabled',
+                                        False,
+                                    )
+                                )
+                                min_n_comp = (
+                                    min(2, n_comp_full)
+                                    if soccer_guidance_on
+                                    else 1
+                                )
+                                raw_tmp_n_comp = tmp_n_comp
+                                tmp_n_comp = max(
+                                    min_n_comp,
+                                    tmp_n_comp,
+                                )
+
+                                if (
+                                    soccer_guidance_on
+                                    and tmp_n_comp != raw_tmp_n_comp
+                                ):
+                                    utils.print_color(
+                                        '[Soccer Guidance] '
+                                        f'adaptive K clamped: '
+                                        f'{raw_tmp_n_comp} -> {tmp_n_comp}',
+                                        c='y',
+                                    )
+
+                                tmp_cur_hzn = self.get_comp_hzn(
+                                    num_comp=tmp_n_comp
+                                )
                                 
                                 utils.print_color(f'{i_et=} {wp_idx=} {prev_dfu_wp_idx=} {tmp_cnt_wp=} {tmp_v1=}')
                                 utils.print_color(f'{i_et=} {wp_idx=} {prev_hzn=} {tmp_n_comp=} {tmp_cur_hzn=} {ada_used_dist=:.2f}')
                                 
                                 # pdb.set_trace()
+
+                            if bool(
+                                getattr(
+                                    self.policy.diffusion_model,
+                                    'soccer_guidance_enabled',
+                                    False,
+                                )
+                            ):
+                                tmp_n_comp = max(
+                                    min(2, n_comp_full),
+                                    tmp_n_comp,
+                                )
 
                             self.policy.n_comp = tmp_n_comp
                             # pdb.set_trace()

@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from torch import nn
 import pdb, einops
+import os
 import torch.nn.functional as F
 
 import diffuser.utils as utils
@@ -80,6 +81,122 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
         # self.setup_invdyn()
         self.is_inv_dyn_dfu = True
         self.len_ovlp_cd = self.diff_config['len_ovlp_cd']
+
+        # ------------------------------------------------------------------
+        # Training-free AntSoccer release guidance.
+        # Disabled by default: baseline is unchanged unless
+        # SOCCER_RELEASE_GUIDANCE=1 is set.
+        #
+        # The 17D planner contains Ant/Ball positions + Ant joint positions,
+        # but no velocity state dimensions. Motion is estimated by finite
+        # differences of consecutive positions.
+        # ------------------------------------------------------------------
+        is_soccer_17d = (self.observation_dim == 17)
+
+        # Independent flags: either guidance can be used alone or together.
+        self.release_guidance_enabled = (
+            is_soccer_17d
+            and os.environ.get('SOCCER_RELEASE_GUIDANCE', '0') == '1'
+        )
+        self.sep_guidance_enabled = (
+            is_soccer_17d
+            and os.environ.get('SOCCER_SEP_GUIDANCE', '0') == '1'
+        )
+        self.soccer_guidance_enabled = (
+            self.release_guidance_enabled or self.sep_guidance_enabled
+        )
+
+        # Release:
+        #   encourage Ball to move toward the goal faster than Ant.
+        self.release_guidance_scale = float(
+            os.environ.get('SOCCER_RELEASE_SCALE', '1.0')
+        )
+        self.release_guidance_margin = float(
+            os.environ.get('SOCCER_RELEASE_MARGIN', '0.02')
+        )
+        self.release_guidance_window = int(
+            os.environ.get('SOCCER_RELEASE_WINDOW', '20')
+        )
+
+        # Separation:
+        #   after a short delay from closest approach, encourage Ant and Ball
+        #   to be at least SEP_MIN_DIST apart.
+        self.sep_guidance_scale = float(
+            os.environ.get('SOCCER_SEP_SCALE', '1.0')
+        )
+        self.sep_guidance_min_dist = float(
+            os.environ.get('SOCCER_SEP_MIN_DIST', '0.25')
+        )
+        self.sep_guidance_delay = int(
+            os.environ.get('SOCCER_SEP_DELAY', '3')
+        )
+        self.sep_guidance_window = int(
+            os.environ.get('SOCCER_SEP_WINDOW', '20')
+        )
+
+        # Contact timing/proximity:
+        # choose the closest Ant-Ball approach only from times that still leave
+        # enough future trajectory for the enabled release/separation windows.
+        # A soft proximity energy then makes that selected early contact real
+        # instead of merely starting post-contact guidance at an arbitrary time.
+        self.contact_guidance_enabled = (
+            is_soccer_17d
+            and os.environ.get('SOCCER_CONTACT_GUIDANCE', '1') == '1'
+            and self.soccer_guidance_enabled
+        )
+        self.contact_guidance_scale = float(
+            os.environ.get('SOCCER_CONTACT_SCALE', '0.2')
+        )
+        self.contact_guidance_max_dist = float(
+            os.environ.get('SOCCER_CONTACT_MAX_DIST', '0.05')
+        )
+
+        # Common gradient clipping after combining enabled energies.
+        self.soccer_guidance_grad_clip = float(
+            os.environ.get(
+                'SOCCER_GUIDANCE_GRAD_CLIP',
+                os.environ.get('SOCCER_RELEASE_GRAD_CLIP', '0.05')
+            )
+        )
+        self.soccer_guidance_debug = (
+            os.environ.get(
+                'SOCCER_GUIDANCE_DEBUG',
+                os.environ.get('SOCCER_RELEASE_DEBUG', '1')
+            ) == '1'
+        )
+
+        if self.soccer_guidance_enabled:
+            assert self.observation_dim == 17
+            assert self.release_guidance_scale >= 0.0
+            assert self.release_guidance_margin >= 0.0
+            assert self.release_guidance_window >= 1
+            assert self.sep_guidance_scale >= 0.0
+            assert self.sep_guidance_min_dist >= 0.0
+            assert self.sep_guidance_delay >= 0
+            assert self.sep_guidance_window >= 1
+            assert self.contact_guidance_scale >= 0.0
+            assert self.contact_guidance_max_dist >= 0.0
+            assert self.soccer_guidance_grad_clip >= 0.0
+
+        if self.soccer_guidance_enabled:
+            utils.print_color(
+                '[Soccer Guidance] ENABLED | '
+                f'release={self.release_guidance_enabled} '
+                f'(scale={self.release_guidance_scale}, '
+                f'margin={self.release_guidance_margin}, '
+                f'window={self.release_guidance_window}) | '
+                f'sep={self.sep_guidance_enabled} '
+                f'(scale={self.sep_guidance_scale}, '
+                f'min_dist={self.sep_guidance_min_dist}, '
+                f'delay={self.sep_guidance_delay}, '
+                f'window={self.sep_guidance_window}) | '
+                f'contact={self.contact_guidance_enabled} '
+                f'(scale={self.contact_guidance_scale}, '
+                f'max_dist={self.contact_guidance_max_dist}) | '
+                f'all_denoising_steps=True',
+                c='y'
+            )
+
         self.is_direct_train = self.diff_config.get('is_direct_train', False)
         if self.is_direct_train:
             self.setup_sep16()
@@ -1005,6 +1122,730 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
     
 
 
+    # ----------------------------------------------------------------------
+    # Training-free release guidance helpers
+    # ----------------------------------------------------------------------
+
+    def _release_direction_from_stgl(self, stgl_cond, device, dtype):
+        """Unit vector u from current Ball position to requested Ball goal."""
+        st = stgl_cond[0].to(device=device, dtype=dtype)
+        gl = stgl_cond[self.horizon - 1].to(device=device, dtype=dtype)
+
+        ball_start = st[:, -2:]
+        ball_goal = gl[:, -2:]
+
+        delta = ball_goal - ball_start
+        norm = torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
+        valid_dir = norm[:, 0] > 1e-6
+        u = delta / torch.clamp(norm, min=1e-6)
+        return u.detach(), valid_dir.detach()
+
+
+    def _release_should_apply(self, sampling_step, n_sampling_steps):
+        """Apply enabled soccer guidance at every denoising step."""
+        return self.soccer_guidance_enabled
+
+
+    @torch.no_grad()
+    def _select_global_contact_from_xt(self, x_p_list):
+        """
+        V6: estimate one global contact time per batch candidate, but DO NOT
+        allow the selector to choose a contact so late that the requested
+        post-contact guidance window no longer fits in the full composed plan.
+
+        For K components:
+            total_horizon = H + (K-1) * (H-overlap)
+
+        Latest valid contact:
+          release needs W transitions:
+            contact <= total_horizon - W - 1
+          separation needs delay + W states:
+            contact <= total_horizon - delay - W
+
+        We search for the closest Ant-Ball state only at global times up to
+        that deadline. This removes the degenerate solution "put the closest
+        contact at the final frame, where release/sep have zero steps".
+        """
+        assert len(x_p_list) >= 2
+
+        stride = self.horizon - self.len_ovlp_cd
+        assert stride > 0
+
+        n_comp = len(x_p_list)
+        total_horizon = (
+            self.horizon + (n_comp - 1) * stride
+        )
+
+        latest_contact = total_horizon - 1
+
+        if self.release_guidance_enabled:
+            latest_contact = min(
+                latest_contact,
+                total_horizon
+                - self.release_guidance_window
+                - 1,
+            )
+
+        if self.sep_guidance_enabled:
+            latest_contact = min(
+                latest_contact,
+                total_horizon
+                - self.sep_guidance_delay
+                - self.sep_guidance_window,
+            )
+
+        # With the experiment settings and K>=2 this should be comfortably
+        # non-negative. Keep a hard sanity check instead of silently clipping.
+        assert latest_contact >= 0, (
+            f'No room for post-contact guidance: '
+            f'total_horizon={total_horizon}, '
+            f'latest_contact={latest_contact}'
+        )
+
+        min_dist_per_comp = []
+        local_idx_per_comp = []
+
+        for i_comp, x_comp in enumerate(x_p_list):
+            assert x_comp.ndim == 3
+            assert x_comp.shape[-1] == 17
+
+            ant_xy = x_comp[:, :, 0:2]
+            ball_xy = x_comp[:, :, -2:]
+
+            dist = torch.linalg.vector_norm(
+                ant_xy - ball_xy, dim=-1
+            )
+
+            local_t = torch.arange(
+                x_comp.shape[1],
+                device=x_comp.device,
+            )
+            global_t = i_comp * stride + local_t
+
+            valid_t = global_t <= latest_contact
+
+            # Every batch item uses the same temporal validity mask.
+            masked_dist = torch.where(
+                valid_t[None, :],
+                dist,
+                torch.full_like(dist, float('inf')),
+            )
+
+            min_val, min_idx = masked_dist.min(dim=1)
+
+            min_dist_per_comp.append(min_val)
+            local_idx_per_comp.append(min_idx)
+
+        min_dist_per_comp = torch.stack(
+            min_dist_per_comp, dim=1
+        )
+        local_idx_per_comp = torch.stack(
+            local_idx_per_comp, dim=1
+        )
+
+        selected_comp = torch.argmin(
+            min_dist_per_comp, dim=1
+        )
+
+        selected_local = torch.gather(
+            local_idx_per_comp,
+            dim=1,
+            index=selected_comp[:, None],
+        )[:, 0]
+
+        global_contact = (
+            selected_comp * stride + selected_local
+        )
+
+        selected_min_dist = torch.gather(
+            min_dist_per_comp,
+            dim=1,
+            index=selected_comp[:, None],
+        )[:, 0]
+
+        assert bool((global_contact <= latest_contact).all())
+
+        return (
+            selected_comp.detach(),
+            selected_local.detach(),
+            global_contact.detach(),
+            selected_min_dist.detach(),
+            int(latest_contact),
+            int(total_horizon),
+        )
+
+
+    @torch.no_grad()
+    def _cross_component_active_mask(
+        self,
+        global_contact,
+        component_idx,
+    ):
+        """
+        Return a per-batch mask saying whether this component overlaps either
+        enabled global post-contact guidance window.
+        """
+        stride = self.horizon - self.len_ovlp_cd
+        comp_start = int(component_idx) * stride
+
+        active = torch.zeros_like(
+            global_contact, dtype=torch.bool
+        )
+
+        if self.release_guidance_enabled:
+            # release is defined on transitions. Local transition t has global
+            # time comp_start+t, t in [0, H-2].
+            comp_first = comp_start
+            comp_last = comp_start + self.horizon - 2
+
+            win_first = global_contact
+            win_last = (
+                global_contact
+                + self.release_guidance_window
+                - 1
+            )
+
+            active = active | (
+                (win_first <= comp_last)
+                & (win_last >= comp_first)
+            )
+
+        if self.sep_guidance_enabled:
+            # separation is defined on states.
+            comp_first = comp_start
+            comp_last = comp_start + self.horizon - 1
+
+            win_first = (
+                global_contact + self.sep_guidance_delay
+            )
+            win_last = (
+                win_first
+                + self.sep_guidance_window
+                - 1
+            )
+
+            active = active | (
+                (win_first <= comp_last)
+                & (win_last >= comp_first)
+            )
+
+        return active.detach()
+
+
+    def _compute_soccer_guidance_grad_xt(
+        self,
+        x_t,
+        base_epsilon,
+        alpha_prod_t,
+        beta_prod_t,
+        release_ctx,
+        timesteps=None,
+    ):
+        """
+        V5 training-free score guidance.
+
+        The energy is evaluated on a clean x0 proxy, but differentiated with
+        respect to current noisy x_t.  For compositional planning, the
+        release/separation windows are defined in GLOBAL trajectory time so a
+        post-contact window can continue into the next overlapping component.
+
+        For epsilon parameterization of the DDIM score:
+            score_guided = score - grad_x E
+            epsilon_guided
+                = epsilon + sqrt(1-alpha_bar_t) * grad_x E
+
+        The network itself remains stop-gradient.
+        """
+        if (not self.soccer_guidance_enabled) or release_ctx is None:
+            return None
+
+        assert x_t.ndim == 3
+        assert x_t.shape[-1] == 17
+        assert base_epsilon.shape == x_t.shape
+        assert release_ctx['active_mask'].shape[0] == x_t.shape[0]
+
+        base_active_mask = release_ctx['active_mask'].to(
+            device=x_t.device, dtype=torch.bool
+        )
+
+        valid_dir = release_ctx.get(
+            'valid_dir',
+            torch.ones(
+                x_t.shape[0],
+                device=x_t.device,
+                dtype=torch.bool,
+            ),
+        ).to(device=x_t.device, dtype=torch.bool)
+
+        release_active_mask = (
+            base_active_mask & valid_dir
+            if self.release_guidance_enabled
+            else torch.zeros_like(base_active_mask)
+        )
+        sep_active_mask = (
+            base_active_mask
+            if self.sep_guidance_enabled
+            else torch.zeros_like(base_active_mask)
+        )
+
+        if not bool(
+            release_active_mask.any()
+            or sep_active_mask.any()
+        ):
+            return None
+
+        u = release_ctx['u'].to(
+            device=x_t.device, dtype=x_t.dtype
+        )
+        component_idx = int(
+            release_ctx.get('component_idx', 0)
+        )
+
+        stride = self.horizon - self.len_ovlp_cd
+        comp_start_global = int(
+            release_ctx.get(
+                'component_start_global',
+                component_idx * stride,
+            )
+        )
+
+        # K>=2 passes a global contact selected across all components.
+        # K==1 falls back to contact estimated from this x0 proxy.
+        supplied_global_contact = release_ctx.get(
+            'global_contact_idx', None
+        )
+
+        sampling_step = int(
+            release_ctx.get('sampling_step', -1)
+        )
+        n_sampling_steps = int(
+            release_ctx.get('n_sampling_steps', -1)
+        )
+
+        with torch.enable_grad():
+            xtg = x_t.detach().clone().requires_grad_(True)
+            eps_det = base_epsilon.detach()
+
+            sqrt_alpha = torch.sqrt(
+                torch.clamp(
+                    alpha_prod_t.detach(), min=1e-8
+                )
+            )
+            sqrt_beta = torch.sqrt(
+                torch.clamp(
+                    beta_prod_t.detach(), min=1e-8
+                )
+            )
+
+            x0_proxy = (
+                xtg - sqrt_beta * eps_det
+            ) / sqrt_alpha
+            x0_proxy = torch.clamp(
+                x0_proxy, min=-1.0, max=1.0
+            )
+
+            ant_xy = x0_proxy[:, :, 0:2]
+            ball_xy = x0_proxy[:, :, -2:]
+
+            ant_ball_dist = torch.linalg.vector_norm(
+                ant_xy - ball_xy, dim=-1
+            )
+
+            # x0-local closest approach is diagnostic only for K>=2.
+            local_closest_x0 = torch.argmin(
+                ant_ball_dist.detach(), dim=1
+            )
+
+            if supplied_global_contact is None:
+                # K==1 fallback: keep contact early enough for the requested
+                # post-contact window. Planner V6 normally keeps K>=2.
+                local_latest = x0_proxy.shape[1] - 1
+                if self.release_guidance_enabled:
+                    local_latest = min(
+                        local_latest,
+                        x0_proxy.shape[1]
+                        - self.release_guidance_window
+                        - 1,
+                    )
+                if self.sep_guidance_enabled:
+                    local_latest = min(
+                        local_latest,
+                        x0_proxy.shape[1]
+                        - self.sep_guidance_delay
+                        - self.sep_guidance_window,
+                    )
+                local_latest = max(0, int(local_latest))
+
+                early_dist = ant_ball_dist.detach().clone()
+                if local_latest + 1 < early_dist.shape[1]:
+                    early_dist[:, local_latest + 1:] = float('inf')
+
+                local_closest_x0 = torch.argmin(
+                    early_dist, dim=1
+                )
+                global_contact = (
+                    local_closest_x0 + comp_start_global
+                ).detach()
+            else:
+                global_contact = supplied_global_contact.to(
+                    device=x_t.device, dtype=torch.long
+                )
+
+            total_energy = None
+            contact_energy_per_sample = None
+            release_energy_per_sample = None
+            sep_energy_per_sample = None
+            rel_forward = None
+            contact_mask = None
+            release_window_mask = None
+            sep_window_mask = None
+
+            # ----------------------------------------------------------
+            # CONTACT proximity at the deadline-safe selected contact.
+            # ----------------------------------------------------------
+            if self.contact_guidance_enabled:
+                global_state_t_contact = (
+                    comp_start_global
+                    + torch.arange(
+                        x0_proxy.shape[1],
+                        device=x0_proxy.device,
+                    )[None, :]
+                )
+
+                contact_mask = (
+                    (
+                        global_state_t_contact
+                        == global_contact[:, None]
+                    )
+                    & base_active_mask[:, None]
+                )
+
+                contact_penalty = F.relu(
+                    ant_ball_dist
+                    - self.contact_guidance_max_dist
+                ) ** 2
+
+                contact_energy_per_sample = (
+                    contact_penalty
+                    * contact_mask.to(x0_proxy.dtype)
+                ).sum(dim=1)
+
+                total_energy = (
+                    self.contact_guidance_scale
+                    * contact_energy_per_sample.sum()
+                )
+
+            # ----------------------------------------------------------
+            # RELEASE in GLOBAL trajectory time.
+            # ----------------------------------------------------------
+            if self.release_guidance_enabled:
+                d_ant = (
+                    ant_xy[:, 1:, :]
+                    - ant_xy[:, :-1, :]
+                )
+                d_ball = (
+                    ball_xy[:, 1:, :]
+                    - ball_xy[:, :-1, :]
+                )
+
+                rel_forward = torch.sum(
+                    (d_ball - d_ant) * u[:, None, :],
+                    dim=-1,
+                )
+
+                global_transition_t = (
+                    comp_start_global
+                    + torch.arange(
+                        x0_proxy.shape[1] - 1,
+                        device=x0_proxy.device,
+                    )[None, :]
+                )
+
+                release_window_mask = (
+                    (
+                        global_transition_t
+                        >= global_contact[:, None]
+                    )
+                    & (
+                        global_transition_t
+                        < (
+                            global_contact[:, None]
+                            + self.release_guidance_window
+                        )
+                    )
+                    & release_active_mask[:, None]
+                )
+
+                release_window_f = (
+                    release_window_mask.to(x0_proxy.dtype)
+                )
+
+                release_penalty = F.relu(
+                    self.release_guidance_margin
+                    - rel_forward
+                ) ** 2
+
+                release_energy_per_sample = (
+                    release_penalty
+                    * release_window_f
+                ).sum(dim=1)
+
+                weighted_release = (
+                    self.release_guidance_scale
+                    * release_energy_per_sample.sum()
+                )
+                total_energy = (
+                    weighted_release
+                    if total_energy is None
+                    else total_energy + weighted_release
+                )
+
+            # ----------------------------------------------------------
+            # SEPARATION in GLOBAL trajectory time.
+            # ----------------------------------------------------------
+            if self.sep_guidance_enabled:
+                global_state_t = (
+                    comp_start_global
+                    + torch.arange(
+                        x0_proxy.shape[1],
+                        device=x0_proxy.device,
+                    )[None, :]
+                )
+
+                sep_start_global = (
+                    global_contact
+                    + self.sep_guidance_delay
+                )
+
+                sep_window_mask = (
+                    (
+                        global_state_t
+                        >= sep_start_global[:, None]
+                    )
+                    & (
+                        global_state_t
+                        < (
+                            sep_start_global[:, None]
+                            + self.sep_guidance_window
+                        )
+                    )
+                    & sep_active_mask[:, None]
+                )
+
+                sep_window_f = (
+                    sep_window_mask.to(x0_proxy.dtype)
+                )
+
+                sep_penalty = F.relu(
+                    self.sep_guidance_min_dist
+                    - ant_ball_dist
+                ) ** 2
+
+                sep_energy_per_sample = (
+                    sep_penalty
+                    * sep_window_f
+                ).sum(dim=1)
+
+                weighted_sep = (
+                    self.sep_guidance_scale
+                    * sep_energy_per_sample.sum()
+                )
+
+                total_energy = (
+                    weighted_sep
+                    if total_energy is None
+                    else total_energy + weighted_sep
+                )
+
+            if total_energy is None:
+                return None
+
+            raw_grad_xt = torch.autograd.grad(
+                total_energy,
+                xtg,
+                retain_graph=False,
+                create_graph=False,
+            )[0]
+
+            # Do not alter exact local trajectory endpoints.
+            raw_grad_xt = raw_grad_xt.clone()
+            raw_grad_xt[:, 0, :] = 0.0
+            raw_grad_xt[:, -1, :] = 0.0
+
+            grad_xt = raw_grad_xt
+
+            if self.soccer_guidance_grad_clip > 0:
+                grad_xt = torch.clamp(
+                    grad_xt,
+                    min=-self.soccer_guidance_grad_clip,
+                    max=self.soccer_guidance_grad_clip,
+                )
+
+            grad_xt = grad_xt.detach()
+
+            # ----------------------------------------------------------
+            # V5 diagnostics: beginning / middle / end of denoising.
+            # ----------------------------------------------------------
+            debug_steps = set()
+            if n_sampling_steps > 0:
+                debug_steps = {
+                    0,
+                    n_sampling_steps // 2,
+                    n_sampling_steps - 1,
+                }
+
+            if (
+                self.soccer_guidance_debug
+                and sampling_step in debug_steps
+            ):
+                active_ids = torch.where(
+                    base_active_mask
+                )[0]
+
+                if len(active_ids) > 0:
+                    b = int(active_ids[0].item())
+
+                    raw_b = raw_grad_xt[b].detach()
+                    post_b = grad_xt[b].detach()
+
+                    raw_norm = torch.linalg.vector_norm(
+                        raw_b.reshape(-1)
+                    ).item()
+                    post_norm = torch.linalg.vector_norm(
+                        post_b.reshape(-1)
+                    ).item()
+                    raw_max = raw_b.abs().max().item()
+
+                    if self.soccer_guidance_grad_clip > 0:
+                        clip_fraction = (
+                            raw_b.abs()
+                            > self.soccer_guidance_grad_clip
+                        ).float().mean().item()
+                    else:
+                        clip_fraction = 0.0
+
+                    delta_eps_norm = (
+                        torch.linalg.vector_norm(
+                            (
+                                sqrt_beta[b] * post_b
+                            ).reshape(-1)
+                        ).item()
+                    )
+
+                    r_steps = (
+                        int(
+                            release_window_mask[b]
+                            .sum()
+                            .detach()
+                            .item()
+                        )
+                        if release_window_mask is not None
+                        else 0
+                    )
+                    s_steps = (
+                        int(
+                            sep_window_mask[b]
+                            .sum()
+                            .detach()
+                            .item()
+                        )
+                        if sep_window_mask is not None
+                        else 0
+                    )
+
+                    msg = (
+                        '[Soccer Guidance V5] '
+                        f'denoise_step={sampling_step}/'
+                        f'{n_sampling_steps-1} '
+                        f'comp={component_idx} '
+                        f'batch={b} '
+                        f'global_contact='
+                        f'{int(global_contact[b].item())} '
+                        f'latest_contact='
+                        f'{release_ctx.get("latest_contact_allowed", -1)} '
+                        f'selected_contact_dist_xt='
+                        f'{float(release_ctx.get("selected_contact_min_dist")[b].item()) if release_ctx.get("selected_contact_min_dist", None) is not None else float("nan"):.4f} '
+                        f'local_closest_x0='
+                        f'{int(local_closest_x0[b].item())} '
+                        f'min_dist_x0='
+                        f'{ant_ball_dist[b].min().detach().item():.4f} '
+                        f'release_steps_here={r_steps} '
+                        f'sep_steps_here={s_steps}'
+                    )
+
+                    if (
+                        self.contact_guidance_enabled
+                        and contact_energy_per_sample
+                        is not None
+                    ):
+                        cmask = contact_mask[b]
+                        contact_dist_x0 = (
+                            ant_ball_dist[b][cmask]
+                            .mean()
+                            .detach()
+                            .item()
+                            if bool(cmask.any())
+                            else float('nan')
+                        )
+                        msg += (
+                            f' | Econtact='
+                            f'{contact_energy_per_sample[b].detach().item():.6f}'
+                            f' contact_dist_x0={contact_dist_x0:.5f}'
+                        )
+
+                    if (
+                        self.release_guidance_enabled
+                        and release_energy_per_sample
+                        is not None
+                    ):
+                        rmask = release_window_mask[b]
+                        mean_rel = (
+                            rel_forward[b][rmask]
+                            .mean()
+                            .detach()
+                            .item()
+                            if bool(rmask.any())
+                            else float('nan')
+                        )
+                        msg += (
+                            f' | Erel='
+                            f'{release_energy_per_sample[b].detach().item():.6f}'
+                            f' mean_rel={mean_rel:.5f}'
+                        )
+
+                    if (
+                        self.sep_guidance_enabled
+                        and sep_energy_per_sample
+                        is not None
+                    ):
+                        smask = sep_window_mask[b]
+                        mean_sep = (
+                            ant_ball_dist[b][smask]
+                            .mean()
+                            .detach()
+                            .item()
+                            if bool(smask.any())
+                            else float('nan')
+                        )
+                        msg += (
+                            f' | Esep='
+                            f'{sep_energy_per_sample[b].detach().item():.6f}'
+                            f' mean_sep={mean_sep:.5f}'
+                        )
+
+                    msg += (
+                        f' | grad_raw_norm={raw_norm:.6f}'
+                        f' grad_raw_max={raw_max:.6f}'
+                        f' clipped_fraction={clip_fraction:.4f}'
+                        f' grad_post_norm={post_norm:.6f}'
+                        f' delta_epsilon_norm={delta_eps_norm:.6f}'
+                    )
+
+                    print(msg)
+
+        return grad_xt
+
+
     def ddim_set_timesteps(self, num_inference_steps) -> np.ndarray: 
 
         self.num_inference_steps = num_inference_steps
@@ -1019,51 +1860,74 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
 
     @torch.no_grad()
     def ddim_p_sample_loop(self, shape, g_cond, verbose=True, return_diffusion=False):
-        
+
         utils.print_color(f'ddim steps: {self.ddim_num_inference_steps}', c='y')
-        
+
         device = self.betas.device
         batch_size = shape[0]
         x = self.var_temp * torch.randn(shape, device=device)
-        # x = apply_conditioning(x, cond, 0) # start from dim 0, different from diffuser
 
-        if return_diffusion: diffusion = [x]
-        # 100 // 20 = 5
-        ## e.g., array([459, 408, 357, 306, 255, 204, 153, 102,  51,   0])
+        if return_diffusion:
+            diffusion = [x]
+
         time_idx = self.ddim_set_timesteps(self.ddim_num_inference_steps)
+        n_sampling_steps = len(time_idx)
 
+        release_u, release_valid_dir = None, None
+        if self.soccer_guidance_enabled and 'stgl_cond' in g_cond:
+            release_u, release_valid_dir = self._release_direction_from_stgl(
+                g_cond['stgl_cond'], device=device, dtype=x.dtype
+            )
 
-        # pdb.set_trace() ## check time_idx
-        # for i in time_idx: # if np array, i is <class 'numpy.int64'>
         from tqdm import tqdm
-        for i in tqdm(time_idx):
-            
-            
-            timesteps = torch.full((batch_size, self.horizon), i, device=device, dtype=torch.long)
-            
-            ## this get func is not for composing
+        for i_step, i in enumerate(tqdm(time_idx)):
+            timesteps = torch.full(
+                (batch_size, self.horizon),
+                i,
+                device=device,
+                dtype=torch.long,
+            )
+
             x, tj_cond = self.get_tj_cond(x, g_cond, timesteps)
 
-            ## From Here Dec 3, 16:04
+            release_ctx = None
+            if (
+                release_u is not None
+                and self._release_should_apply(i_step, n_sampling_steps)
+            ):
+                release_ctx = dict(
+                    u=release_u,
+                    valid_dir=release_valid_dir,
+                    active_mask=torch.ones(
+                        batch_size, device=device, dtype=torch.bool
+                    ),
+                    component_idx=0,
+                    component_start_global=0,
+                    sampling_step=i_step,
+                    n_sampling_steps=n_sampling_steps,
+                )
 
-            ## ----------------------
-            ### eta=0.0
-            x = self.ddim_p_sample(x, tj_cond, timesteps, self.ddim_eta, use_clipped_model_output=True)
-            # x = apply_conditioning(x, cond, 0)
+            x = self.ddim_p_sample(
+                x,
+                tj_cond,
+                timesteps,
+                self.ddim_eta,
+                use_clipped_model_output=True,
+                release_ctx=release_ctx,
+            )
 
-            if return_diffusion: diffusion.append(x)
-        
+            if return_diffusion:
+                diffusion.append(x)
 
         if return_diffusion:
             return x, torch.stack(diffusion, dim=1)
         else:
             return x
-        
 
 
     @torch.no_grad()
     def ddim_p_sample(self, x, tj_cond, timesteps, eta=0.0, 
-                      use_clipped_model_output=False):
+                      use_clipped_model_output=False, release_ctx=None):
         ''' NOTE follow diffusers ddim, any post-processing *NOT CHECKED yet*
         timesteps (cuda tensor [B,H]) must be same
         eta: weight for noise
@@ -1106,8 +1970,17 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
         model_mean, _, model_log_variance, x_recon, model_output = \
                 self.p_mean_variance(x=x, t_2d=timesteps, tj_cond=tj_cond, return_modelout=True)
 
-
-
+        # Training-free score guidance.
+        soccer_grad_xt = None
+        if release_ctx is not None:
+            soccer_grad_xt = self._compute_soccer_guidance_grad_xt(
+                x_t=x,
+                base_epsilon=model_output,
+                alpha_prod_t=alpha_prod_t,
+                beta_prod_t=beta_prod_t,
+                release_ctx=release_ctx,
+                timesteps=timesteps,
+            )
 
         ## 5. compute variance
         variance = (1 - alpha_prod_t_prev) / (1 - alpha_prod_t) \
@@ -1119,9 +1992,39 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
         if use_clipped_model_output:
 
             sample = x
-            pred_original_sample = x_recon
-            model_output = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
-            
+
+            if soccer_grad_xt is not None:
+                # score_g = score - grad E
+                # epsilon_g = epsilon + sqrt(beta_t) * grad E
+                model_output = (
+                    model_output
+                    + torch.sqrt(torch.clamp(beta_prod_t, min=1e-8))
+                    * soccer_grad_xt
+                )
+
+                pred_original_sample = (
+                    sample
+                    - torch.sqrt(torch.clamp(beta_prod_t, min=1e-8))
+                    * model_output
+                ) / torch.sqrt(torch.clamp(alpha_prod_t, min=1e-8))
+
+                pred_original_sample = torch.clamp(
+                    pred_original_sample, min=-1.0, max=1.0
+                )
+
+                # Keep guided epsilon and clipped x0 self-consistent.
+                model_output = (
+                    sample
+                    - torch.sqrt(torch.clamp(alpha_prod_t, min=1e-8))
+                    * pred_original_sample
+                ) / torch.sqrt(torch.clamp(beta_prod_t, min=1e-8))
+
+            else:
+                pred_original_sample = x_recon
+                model_output = (
+                    sample
+                    - alpha_prod_t ** (0.5) * pred_original_sample
+                ) / beta_prod_t ** (0.5)
 
 
         # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
@@ -1197,11 +2100,51 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
         ## -----------------
 
         from tqdm import tqdm
-        for i_t in tqdm(time_idx):
-            
+
+        n_sampling_steps = (
+            len(time_idx)
+            if hasattr(time_idx, '__len__')
+            else self.n_timesteps
+        )
+
+        release_u, release_valid_dir = None, None
+        if self.soccer_guidance_enabled:
+            release_u, release_valid_dir = self._release_direction_from_stgl(
+                stgl_cond, device=device, dtype=x_p_list[0].dtype
+            )
+
+        for i_step, i_t in enumerate(tqdm(time_idx)):
+
             ## timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long) # old
             ## e.g., (B=10,H=384)
             timesteps = torch.full((batch_size, self.horizon), i_t, device=device, dtype=torch.long)
+
+            # V5: select one GLOBAL contact time across all components.
+            # The post-contact windows are then mapped into every overlapping
+            # component, so they are not truncated at component boundaries.
+            global_contact_idx = None
+            selected_contact_comp = None
+            selected_contact_local = None
+            selected_contact_min_dist = None
+            latest_contact_allowed = None
+            composed_total_horizon = None
+
+            if (
+                release_u is not None
+                and self._release_should_apply(
+                    i_step, n_sampling_steps
+                )
+            ):
+                (
+                    selected_contact_comp,
+                    selected_contact_local,
+                    global_contact_idx,
+                    selected_contact_min_dist,
+                    latest_contact_allowed,
+                    composed_total_horizon,
+                ) = self._select_global_contact_from_xt(
+                    x_p_list
+                )
 
             ## iteratively denoise each sub traj
             for i_tj in range(n_comp):
@@ -1230,7 +2173,44 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
                         x_p_i = self.resample_same_t_mcmc(x_p_i, tj_cond_p_i, timesteps)
 
                     if self.use_ddim:
-                        x_p_i = self.ddim_p_sample(x_p_i, tj_cond_p_i, timesteps, self.ddim_eta, use_clipped_model_output=True)
+                        release_ctx = None
+                        if global_contact_idx is not None:
+                            active_mask_v5 = (
+                                self._cross_component_active_mask(
+                                    global_contact_idx,
+                                    component_idx=i_tj,
+                                )
+                            )
+                            if bool(active_mask_v5.any()):
+                                release_ctx = dict(
+                                    u=release_u,
+                                    valid_dir=release_valid_dir,
+                                    active_mask=active_mask_v5,
+                                    component_idx=i_tj,
+                                    component_start_global=(
+                                        i_tj
+                                        * (
+                                            self.horizon
+                                            - self.len_ovlp_cd
+                                        )
+                                    ),
+                                    global_contact_idx=global_contact_idx,
+                                    selected_contact_comp=selected_contact_comp,
+                                    selected_contact_local=selected_contact_local,
+                                    selected_contact_min_dist=selected_contact_min_dist,
+                                    latest_contact_allowed=latest_contact_allowed,
+                                    composed_total_horizon=composed_total_horizon,
+                                    sampling_step=i_step,
+                                    n_sampling_steps=n_sampling_steps,
+                                )
+                        x_p_i = self.ddim_p_sample(
+                            x_p_i,
+                            tj_cond_p_i,
+                            timesteps,
+                            self.ddim_eta,
+                            use_clipped_model_output=True,
+                            release_ctx=release_ctx,
+                        )
                     else:
                         x_p_i = self.p_sample(x_p_i, tj_cond_p_i, timesteps)
                     x_p_list[i_tj] = x_p_i
@@ -1261,7 +2241,44 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
                         x_p_i = self.resample_same_t_mcmc(x_p_i, tj_cond_p_i, timesteps)
 
                     if self.use_ddim:
-                        x_p_i = self.ddim_p_sample(x_p_i, tj_cond_p_i, timesteps, self.ddim_eta, use_clipped_model_output=True)
+                        release_ctx = None
+                        if global_contact_idx is not None:
+                            active_mask_v5 = (
+                                self._cross_component_active_mask(
+                                    global_contact_idx,
+                                    component_idx=i_tj,
+                                )
+                            )
+                            if bool(active_mask_v5.any()):
+                                release_ctx = dict(
+                                    u=release_u,
+                                    valid_dir=release_valid_dir,
+                                    active_mask=active_mask_v5,
+                                    component_idx=i_tj,
+                                    component_start_global=(
+                                        i_tj
+                                        * (
+                                            self.horizon
+                                            - self.len_ovlp_cd
+                                        )
+                                    ),
+                                    global_contact_idx=global_contact_idx,
+                                    selected_contact_comp=selected_contact_comp,
+                                    selected_contact_local=selected_contact_local,
+                                    selected_contact_min_dist=selected_contact_min_dist,
+                                    latest_contact_allowed=latest_contact_allowed,
+                                    composed_total_horizon=composed_total_horizon,
+                                    sampling_step=i_step,
+                                    n_sampling_steps=n_sampling_steps,
+                                )
+                        x_p_i = self.ddim_p_sample(
+                            x_p_i,
+                            tj_cond_p_i,
+                            timesteps,
+                            self.ddim_eta,
+                            use_clipped_model_output=True,
+                            release_ctx=release_ctx,
+                        )
                     else:
                         x_p_i = self.p_sample(x_p_i, tj_cond_p_i, timesteps)
                     
@@ -1290,7 +2307,44 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
                         x_p_i = self.resample_same_t_mcmc( x_p_i, tj_cond_p_i, timesteps )
 
                     if self.use_ddim:
-                        x_p_i = self.ddim_p_sample(x_p_i, tj_cond_p_i, timesteps, self.ddim_eta, use_clipped_model_output=True)
+                        release_ctx = None
+                        if global_contact_idx is not None:
+                            active_mask_v5 = (
+                                self._cross_component_active_mask(
+                                    global_contact_idx,
+                                    component_idx=i_tj,
+                                )
+                            )
+                            if bool(active_mask_v5.any()):
+                                release_ctx = dict(
+                                    u=release_u,
+                                    valid_dir=release_valid_dir,
+                                    active_mask=active_mask_v5,
+                                    component_idx=i_tj,
+                                    component_start_global=(
+                                        i_tj
+                                        * (
+                                            self.horizon
+                                            - self.len_ovlp_cd
+                                        )
+                                    ),
+                                    global_contact_idx=global_contact_idx,
+                                    selected_contact_comp=selected_contact_comp,
+                                    selected_contact_local=selected_contact_local,
+                                    selected_contact_min_dist=selected_contact_min_dist,
+                                    latest_contact_allowed=latest_contact_allowed,
+                                    composed_total_horizon=composed_total_horizon,
+                                    sampling_step=i_step,
+                                    n_sampling_steps=n_sampling_steps,
+                                )
+                        x_p_i = self.ddim_p_sample(
+                            x_p_i,
+                            tj_cond_p_i,
+                            timesteps,
+                            self.ddim_eta,
+                            use_clipped_model_output=True,
+                            release_ctx=release_ctx,
+                        )
                     else:
                         x_p_i = self.p_sample(x_p_i, tj_cond_p_i, timesteps)
                     

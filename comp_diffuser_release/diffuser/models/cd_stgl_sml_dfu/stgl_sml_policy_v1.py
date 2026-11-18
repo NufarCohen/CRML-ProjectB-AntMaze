@@ -139,6 +139,151 @@ class Stgl_Sml_Policy_V1:
 
     
 
+    def _debug_final_soccer_pick_traj(
+        self,
+        pick_traj,
+        st_gl_norm,
+    ):
+        """
+        Diagnose the FINAL blended trajectory that is actually executed.
+
+        V6 reports BOTH:
+          1) the absolute closest Ant-Ball time anywhere in the trajectory;
+          2) the closest contact that occurs early enough to leave the full
+             requested release/separation post-contact window.
+
+        Guidance metrics are measured around (2), not around a possibly
+        degenerate last-frame closest approach.
+        """
+        dm = self.diffusion_model
+
+        if not getattr(dm, 'soccer_guidance_enabled', False):
+            return
+        if not getattr(dm, 'soccer_guidance_debug', False):
+            return
+        if dm.observation_dim != 17:
+            return
+
+        pick_norm = self.normalizer.normalize(
+            np.asarray(pick_traj)[None, ...],
+            'observations',
+        )[0]
+
+        assert pick_norm.ndim == 2
+        assert pick_norm.shape[1] == 17
+
+        ant_xy = pick_norm[:, 0:2]
+        ball_xy = pick_norm[:, -2:]
+
+        dist = np.linalg.norm(
+            ant_xy - ball_xy, axis=-1
+        )
+
+        closest_any = int(np.argmin(dist))
+
+        latest_contact = len(pick_norm) - 1
+
+        if getattr(dm, 'release_guidance_enabled', False):
+            latest_contact = min(
+                latest_contact,
+                len(pick_norm)
+                - dm.release_guidance_window
+                - 1,
+            )
+
+        if getattr(dm, 'sep_guidance_enabled', False):
+            latest_contact = min(
+                latest_contact,
+                len(pick_norm)
+                - dm.sep_guidance_delay
+                - dm.sep_guidance_window,
+            )
+
+        latest_contact = max(0, int(latest_contact))
+
+        closest_early = int(
+            np.argmin(dist[:latest_contact + 1])
+        )
+
+        ball_start = np.asarray(
+            st_gl_norm[0, 0, -2:].detach().cpu()
+        )
+        ball_goal = np.asarray(
+            st_gl_norm[1, 0, -2:].detach().cpu()
+        )
+
+        u_raw = ball_goal - ball_start
+        u_norm = float(np.linalg.norm(u_raw))
+        if u_norm > 1e-8:
+            u = u_raw / u_norm
+        else:
+            u = np.zeros_like(u_raw)
+
+        parts = [
+            '[FINAL TRAJ V6]',
+            f'len={len(pick_norm)}',
+            f'closest_any_t={closest_any}',
+            f'closest_any_dist={dist[closest_any]:.5f}',
+            f'latest_contact_allowed={latest_contact}',
+            f'contact_t={closest_early}',
+            f'contact_dist={dist[closest_early]:.5f}',
+        ]
+
+        if getattr(dm, 'release_guidance_enabled', False):
+            d_ant = ant_xy[1:] - ant_xy[:-1]
+            d_ball = ball_xy[1:] - ball_xy[:-1]
+            rel_forward = (
+                (d_ball - d_ant) * u[None, :]
+            ).sum(axis=-1)
+
+            r0 = min(
+                closest_early,
+                len(rel_forward),
+            )
+            r1 = min(
+                r0 + dm.release_guidance_window,
+                len(rel_forward),
+            )
+
+            mean_rel = (
+                float(rel_forward[r0:r1].mean())
+                if r1 > r0
+                else float('nan')
+            )
+
+            parts.extend([
+                f'release_steps={r1-r0}',
+                f'mean_rel_forward={mean_rel:.5f}',
+                f'release_margin={dm.release_guidance_margin:.5f}',
+            ])
+
+        if getattr(dm, 'sep_guidance_enabled', False):
+            s0 = min(
+                closest_early + dm.sep_guidance_delay,
+                len(dist),
+            )
+            s1 = min(
+                s0 + dm.sep_guidance_window,
+                len(dist),
+            )
+
+            if s1 > s0:
+                mean_sep = float(dist[s0:s1].mean())
+                min_sep = float(dist[s0:s1].min())
+            else:
+                mean_sep = float('nan')
+                min_sep = float('nan')
+
+            parts.extend([
+                f'sep_steps={s1-s0}',
+                f'mean_sep_dist={mean_sep:.5f}',
+                f'min_sep_dist={min_sep:.5f}',
+                f'sep_target={dm.sep_guidance_min_dist:.5f}',
+            ])
+
+        print(' | '.join(parts))
+
+
     ### -------- Oct 20 For Stgl Quan Planning ------
     def gen_cond_stgl(self, g_cond, debug=False, b_s=1):
         """
@@ -218,6 +363,11 @@ class Stgl_Sml_Policy_V1:
             pick_traj = trajs_list_topn_bl[p_idx]
         else:
             raise NotImplementedError
+
+        self._debug_final_soccer_pick_traj(
+            pick_traj,
+            st_gl,
+        )
 
         out = Stgl_Sml_Ev_Pred(pick_traj, trajs_list_topn_bl, trajs_list_np_un)
 
